@@ -45,7 +45,7 @@ class InternalSqlDb:
 class Phase2IInternalSqlUtilsTests(unittest.TestCase):
     def test_internal_sql_helpers_are_not_mcp_tools(self):
         server = faro_mcp.FaroToolRuntime()
-        self.assertEqual(len(server.tools), 81)
+        self.assertEqual(len(server.tools), 85)
         self.assertFalse(any("sql" in name for name in server.tools))
         defs = {x["name"] for x in faro_mcp.tool_definitions()}
         self.assertEqual(defs, set(server.tools))

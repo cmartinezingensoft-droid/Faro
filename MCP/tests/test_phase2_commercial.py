@@ -23,7 +23,7 @@ class FakeDb:
                 "ART_SECCIO": "01", "ART_TIPPRE": "V", "ART_TIPIVA": 1,
                 "ART_CODMON": "E", "ART_UNIMED": "UNI", "ART_PVP": Decimal("121"),
                 "ART_PREVEN1": Decimal("70"), "ART_PREVEN2": Decimal("80"),
-                "ART_PREVEN3": Decimal("90"), "ART_PREVEN4": Decimal("100"),
+                "ART_PREVEN3": Decimal("94"), "ART_PREVEN4": Decimal("100"),
                 "ART_PRETAR": Decimal("0"), "ART_CANPMI": Decimal("0"),
                 "ART_CANPRE": Decimal("1"), "ART_PREBAS": Decimal("50"),
                 "ART_PRECOS": Decimal("55"), "ART_TABPREC": 0, "ART_CODFAM": 0,

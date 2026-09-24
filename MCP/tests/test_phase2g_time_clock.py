@@ -54,11 +54,11 @@ class Phase2GTimeClockTests(unittest.TestCase):
     def test_tool_is_temporarily_not_public(self):
         server = faro_mcp.FaroToolRuntime()
         self.assertNotIn("control_horario_fichar", server.tools)
-        self.assertEqual(len(server.tools), 81)
+        self.assertEqual(len(server.tools), 85)
         self.assertFalse(any(name.startswith("datasnap_") for name in server.tools))
         defs = {item["name"] for item in faro_mcp.tool_definitions()}
         self.assertNotIn("control_horario_fichar", defs)
-        self.assertEqual(len(defs), 81)
+        self.assertEqual(len(defs), 85)
 
     def test_unknown_password_returns_datasnap_error_without_insert(self):
         db = TimeClockDb(user=None)

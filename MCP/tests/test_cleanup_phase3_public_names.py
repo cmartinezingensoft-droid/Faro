@@ -10,8 +10,8 @@ class CleanupPhase3PublicNamesTests(unittest.TestCase):
     def test_public_catalog_uses_only_canonical_names(self):
         server = faro_mcp.FaroToolRuntime()
         definitions = {item["name"] for item in faro_mcp.tool_definitions()}
-        self.assertEqual(len(server.tools), 81)
-        self.assertEqual(len(definitions), 81)
+        self.assertEqual(len(server.tools), 85)
+        self.assertEqual(len(definitions), 85)
         self.assertEqual(set(server.tools), definitions)
         self.assertEqual(set(server.tools), set(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
         self.assertNotIn("list_price_tables", server.tools)

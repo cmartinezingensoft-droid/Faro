@@ -20,10 +20,10 @@ class CleanupPhase6OrdersTests(unittest.TestCase):
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "full"}):
             full = faro_mcp.FaroToolRuntime()
             full_defs = {item["name"] for item in faro_mcp.tool_definitions()}
-        self.assertEqual(len(core.tools), 81)
-        self.assertEqual(len(core_defs), 81)
-        self.assertEqual(len(full.tools), 91)
-        self.assertEqual(len(full_defs), 91)
+        self.assertEqual(len(core.tools), 85)
+        self.assertEqual(len(core_defs), 85)
+        self.assertEqual(len(full.tools), 95)
+        self.assertEqual(len(full_defs), 95)
         self.assertIn("pedido_listar", core.tools)
         self.assertIn("pedido_pdf_gestion", core.tools)
         self.assertTrue({"pedido_listar_cliente", "pedido_pdf_generar", "pedido_pdf_obtener"}.isdisjoint(full.tools))

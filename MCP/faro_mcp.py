@@ -5825,6 +5825,229 @@ class FaroPhase1Service:
             "items": items,
         }
 
+    def representative_info(self, representante: Any) -> dict[str, Any]:
+        codrep = int(representante)
+        row = self.db.fetch_one(
+            "SELECT * FROM REPRESE WHERE REP_NUMEMP=? AND REP_CODREP=?",
+            (self.settings.empresa, codrep),
+        )
+        if not row:
+            return {
+                "codigo": codrep,
+                "nombre": "",
+                "encontrado": False,
+            }
+        return {
+            "codigo": codrep,
+            "nombre": clean_text_value(row.get("REP_NOMBRE")),
+            "poblacion": clean_text_value(row.get("REP_POBLAC")),
+            "telefono": clean_text_value(row.get("REP_TELEFO")),
+            "contacto": clean_text_value(row.get("REP_CONTAC")),
+            "comision": normalize(dec(row.get("REP_COMISI"))),
+            "encontrado": True,
+        }
+
+    def commercial_agent_activities(self, args: dict[str, Any]) -> dict[str, Any]:
+        codrep = int(args["representante"])
+        start = self._parse_optional_date(args.get("fecha_desde"))
+        end = self._parse_optional_date(args.get("fecha_hasta"))
+        if not start or not end:
+            raise FaroError("fecha_desde y fecha_hasta son obligatorias.")
+        if start > end:
+            raise FaroError("fecha_desde no puede ser posterior a fecha_hasta.")
+        limit = max(1, min(int(args.get("limite", 100) or 100), 1000))
+
+        rows = self.db.fetch_all(
+            """
+            SELECT A.ACT_NUMLIN, A.ACT_CODCLI, A.ACT_SUBCLI, A.ACT_REPRES, A.ACT_CODACT,
+                   A.ACT_FECHA, A.ACT_OBSERV, T.TAC_DESCRI, C.CLI_NOMCLI
+            FROM ACTIVI A
+            LEFT JOIN TIPACT T ON T.TAC_NUMEMP=A.ACT_NUMEMP AND T.TAC_CODIGO=A.ACT_CODACT
+            LEFT JOIN CLIEN C ON C.CLI_NUMEMP=A.ACT_NUMEMP
+                AND C.CLI_CODCLI=A.ACT_CODCLI AND C.CLI_SUBCLI=A.ACT_SUBCLI
+            WHERE A.ACT_NUMEMP=? AND A.ACT_REPRES=? AND A.ACT_FECHA BETWEEN ? AND ?
+            ORDER BY A.ACT_FECHA DESC, A.ACT_NUMLIN DESC
+            """,
+            (self.settings.empresa, codrep, start, end),
+        )
+
+        by_type: dict[str, dict[str, Any]] = {}
+        by_client: dict[str, dict[str, Any]] = {}
+        visits = 0
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            tipo_codigo = int(row.get("ACT_CODACT") or 0)
+            tipo_nombre = clean_text_value(row.get("TAC_DESCRI")) or str(tipo_codigo)
+            type_key = str(tipo_codigo)
+            if type_key not in by_type:
+                by_type[type_key] = {
+                    "codigo": tipo_codigo,
+                    "nombre": tipo_nombre,
+                    "actividades": 0,
+                    "clientes_distintos": set(),
+                }
+            by_type[type_key]["actividades"] += 1
+            client_key = f"{int(row.get('ACT_CODCLI') or 0)}/{int(row.get('ACT_SUBCLI') or 0)}"
+            by_type[type_key]["clientes_distintos"].add(client_key)
+            if "VISIT" in tipo_nombre.upper():
+                visits += 1
+            if client_key not in by_client:
+                by_client[client_key] = {
+                    "cliente": int(row.get("ACT_CODCLI") or 0),
+                    "subcliente": int(row.get("ACT_SUBCLI") or 0),
+                    "nombre": clean_text_value(row.get("CLI_NOMCLI")),
+                    "actividades": 0,
+                }
+            by_client[client_key]["actividades"] += 1
+            if len(items) < limit:
+                items.append({
+                    "numlin": int(row.get("ACT_NUMLIN") or 0),
+                    "fecha": normalize(row.get("ACT_FECHA")),
+                    "cliente": {
+                        "codigo": int(row.get("ACT_CODCLI") or 0),
+                        "subcliente": int(row.get("ACT_SUBCLI") or 0),
+                        "nombre": clean_text_value(row.get("CLI_NOMCLI")),
+                    },
+                    "tipo_actividad": {"codigo": tipo_codigo, "nombre": tipo_nombre},
+                    "observacion": clean_text_value(row.get("ACT_OBSERV")),
+                })
+
+        tipos = []
+        for item in by_type.values():
+            clientes = item.pop("clientes_distintos")
+            item["clientes_distintos"] = len(clientes)
+            tipos.append(item)
+        tipos.sort(key=lambda item: (int(item["actividades"]), str(item["nombre"])), reverse=True)
+        clientes = sorted(by_client.values(), key=lambda item: int(item["actividades"]), reverse=True)[:limit]
+
+        return {
+            "representante": self.representative_info(codrep),
+            "fecha_desde": start.isoformat(),
+            "fecha_hasta": end.isoformat(),
+            "total_actividades": len(rows),
+            "visitas_estimadas": visits,
+            "clientes_contactados": len(by_client),
+            "tipos_actividad": tipos,
+            "clientes": clientes,
+            "ultimas_actividades": items,
+        }
+
+    @staticmethod
+    def _commercial_common_sales_args(args: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            "fecha_desde": args.get("fecha_desde"),
+            "fecha_hasta": args.get("fecha_hasta"),
+            "representante": args.get("representante"),
+            "centro": args.get("centro"),
+            "tipos_documento": args.get("tipos_documento"),
+            "incluir_pedidos": bool(args.get("incluir_pedidos", False)),
+            "moneda": args.get("moneda", "E"),
+            "limite": args.get("limite_lineas", args.get("limite", 5000)),
+        }
+        return {key: value for key, value in result.items() if value is not None}
+
+    def commercial_agent_customers(self, args: dict[str, Any]) -> dict[str, Any]:
+        sales_args = self._commercial_common_sales_args(args)
+        limit = max(1, min(int(args.get("limite_clientes", args.get("limite_grupos", 20)) or 20), 200))
+        sales_args.update({
+            "agrupar_por": "cliente",
+            "ordenar_por": str(args.get("ordenar_por", "venta_neta") or "venta_neta"),
+            "sentido": str(args.get("sentido", "desc") or "desc"),
+            "limite_grupos": limit,
+        })
+        ranking = self.sales_profit_summary(sales_args)
+        activity_args = {
+            "representante": args.get("representante"),
+            "fecha_desde": args.get("fecha_desde"),
+            "fecha_hasta": args.get("fecha_hasta"),
+            "limite": max(limit, 100),
+        }
+        activities = self.commercial_agent_activities(activity_args)
+        activity_by_client = {
+            f"{item['cliente']}/{item['subcliente']}": item["actividades"]
+            for item in activities.get("clientes", [])
+        }
+        items = []
+        for item in ranking["items"]:
+            enriched = dict(item)
+            enriched["actividades"] = activity_by_client.get(str(item.get("codigo")), 0)
+            items.append(enriched)
+        return {
+            "representante": self.representative_info(args.get("representante")),
+            "fecha_desde": args.get("fecha_desde"),
+            "fecha_hasta": args.get("fecha_hasta"),
+            "ordenar_por": ranking["ordenar_por"],
+            "totales": ranking["totales"],
+            "count": len(items),
+            "items": items,
+        }
+
+    def commercial_agent_products(self, args: dict[str, Any]) -> dict[str, Any]:
+        sales_args = self._commercial_common_sales_args(args)
+        limit = max(1, min(int(args.get("limite_productos", args.get("limite_grupos", 20)) or 20), 200))
+        sales_args.update({
+            "agrupar_por": "articulo",
+            "ordenar_por": str(args.get("ordenar_por", "venta_neta") or "venta_neta"),
+            "sentido": str(args.get("sentido", "desc") or "desc"),
+            "limite_grupos": limit,
+        })
+        ranking = self.sales_profit_summary(sales_args)
+        return {
+            "representante": self.representative_info(args.get("representante")),
+            "fecha_desde": args.get("fecha_desde"),
+            "fecha_hasta": args.get("fecha_hasta"),
+            "ordenar_por": ranking["ordenar_por"],
+            "totales": ranking["totales"],
+            "count": ranking["count"],
+            "items": ranking["items"],
+        }
+
+    def commercial_agent_analysis(self, args: dict[str, Any]) -> dict[str, Any]:
+        codrep = int(args["representante"])
+        common_args = self._commercial_common_sales_args(args)
+        common_args["representante"] = codrep
+        totals = self.sales_profit_summary({
+            **common_args,
+            "agrupar_por": "representante",
+            "ordenar_por": "venta_neta",
+            "limite_grupos": 1,
+        })
+        customers = self.commercial_agent_customers({
+            **args,
+            "representante": codrep,
+            "limite_clientes": args.get("limite_clientes", 10),
+        })
+        products = self.commercial_agent_products({
+            **args,
+            "representante": codrep,
+            "limite_productos": args.get("limite_productos", 10),
+        })
+        activities = self.commercial_agent_activities({
+            "representante": codrep,
+            "fecha_desde": args.get("fecha_desde"),
+            "fecha_hasta": args.get("fecha_hasta"),
+            "limite": args.get("limite_actividades", 20),
+        })
+        return {
+            "representante": self.representative_info(codrep),
+            "fecha_desde": args.get("fecha_desde"),
+            "fecha_hasta": args.get("fecha_hasta"),
+            "ventas": {
+                "totales": totals["totales"],
+                "base_lineas": totals["base_lineas"],
+                "moneda": totals["moneda"],
+            },
+            "actividades": {
+                "total_actividades": activities["total_actividades"],
+                "visitas_estimadas": activities["visitas_estimadas"],
+                "clientes_contactados": activities["clientes_contactados"],
+                "tipos_actividad": activities["tipos_actividad"],
+                "ultimas_actividades": activities["ultimas_actividades"],
+            },
+            "clientes_top": customers["items"],
+            "productos_top": products["items"],
+        }
+
     def parameter(self, code: str, default: str = "") -> str:
         row = self.db.fetch_one(
             "SELECT PAR_VALOR FROM PARAMETROS WHERE PAR_NUMEMP=? AND PAR_CODIGO=?",
@@ -13814,6 +14037,10 @@ CORE_PUBLIC_TOOL_NAMES = frozenset({
     "actividad_grabar",
     "actividad_listar",
     "actividad_tipo_listar",
+    "comercial_agente_actividades",
+    "comercial_agente_analisis",
+    "comercial_agente_clientes",
+    "comercial_agente_productos",
     # Stock / almacen.
     "stock_consultar",
     "stock_regularizar",
@@ -13911,6 +14138,7 @@ CENTER_SCOPED_TOOL_NAMES = frozenset(
         "stock_",
         "venta_",
         "ventas_",
+        "comercial_",
         "compras_",
         "dashboard_",
         "negocio_",
@@ -13979,6 +14207,10 @@ READ_ONLY_TOOL_NAMES = frozenset({
     "cliente_buscar",
     "cliente_tipo_venta",
     "cliente_ultimas_ventas",
+    "comercial_agente_actividades",
+    "comercial_agente_analisis",
+    "comercial_agente_clientes",
+    "comercial_agente_productos",
     "entrada_pedidos_relacionados",
     "integracion_coinfer_stock",
     "pedido_detalle",
@@ -14307,6 +14539,10 @@ class FaroToolRuntime:
             'cliente_ultimas_ventas': self.tool_cliente_ultimas_ventas,
             'clientes_acciones_recomendadas': self.tool_clientes_acciones_recomendadas,
             'clientes_resumen': self.tool_clientes_resumen,
+            'comercial_agente_actividades': self.tool_comercial_agente_actividades,
+            'comercial_agente_analisis': self.tool_comercial_agente_analisis,
+            'comercial_agente_clientes': self.tool_comercial_agente_clientes,
+            'comercial_agente_productos': self.tool_comercial_agente_productos,
             'compras_articulos_pendientes_recibir': self.tool_compras_articulos_pendientes_recibir,
             'compras_documentos_pendientes_resumen': self.tool_compras_documentos_pendientes_resumen,
             'compras_pedidos_pendientes_resumen': self.tool_compras_pedidos_pendientes_resumen,
@@ -15476,6 +15712,34 @@ class FaroToolRuntime:
         svc = self.phase1_service()
         try:
             return svc.sales_profit_summary(args)
+        finally:
+            svc.db.close()
+
+    def tool_comercial_agente_actividades(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.commercial_agent_activities(args)
+        finally:
+            svc.db.close()
+
+    def tool_comercial_agente_clientes(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.commercial_agent_customers(args)
+        finally:
+            svc.db.close()
+
+    def tool_comercial_agente_productos(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.commercial_agent_products(args)
+        finally:
+            svc.db.close()
+
+    def tool_comercial_agente_analisis(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.commercial_agent_analysis(args)
         finally:
             svc.db.close()
 
@@ -16919,6 +17183,107 @@ _INTERNAL_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {'actividad_grabar': {'d
                                                 'required': ['fecha_desde', 'fecha_hasta'],
                                                 'type': 'object'},
                                 'name': 'venta_rentabilidad_resumen'}}
+
+_COMMERCIAL_AGENT_SCHEMA_PROPERTIES: dict[str, Any] = {
+    "representante": {"type": "integer", "description": "Codigo del agente/representante comercial."},
+    "fecha_desde": {"type": "string", "description": "Fecha inicial en formato YYYY-MM-DD."},
+    "fecha_hasta": {"type": "string", "description": "Fecha final en formato YYYY-MM-DD."},
+    "tipos_documento": {
+        "items": {"enum": ["T", "F", "A", "C", "P", "R", "S"], "type": "string"},
+        "type": "array",
+        "description": "Tipos de venta a analizar. Por defecto usa ventas reales.",
+    },
+    "incluir_pedidos": {
+        "default": False,
+        "type": "boolean",
+        "description": "Incluye pedidos/presupuestos y documentos no firmados en el calculo de ventas.",
+    },
+    "moneda": {"default": "E", "enum": ["E", "P"], "type": "string"},
+    "limite_lineas": {
+        "default": 5000,
+        "type": "integer",
+        "description": "Maximo de lineas base de venta/rentabilidad a analizar.",
+    },
+}
+
+_INTERNAL_TOOL_DEFINITIONS.update({
+    "comercial_agente_actividades": {
+        "name": "comercial_agente_actividades",
+        "description": (
+            "Comercial/agentes. LECTURA. Resume actividades y visitas de un agente "
+            "desde ACTIVI, agrupando por tipo de actividad y cliente."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "representante": _COMMERCIAL_AGENT_SCHEMA_PROPERTIES["representante"],
+                "fecha_desde": _COMMERCIAL_AGENT_SCHEMA_PROPERTIES["fecha_desde"],
+                "fecha_hasta": _COMMERCIAL_AGENT_SCHEMA_PROPERTIES["fecha_hasta"],
+                "limite": {"default": 100, "type": "integer", "description": "Maximo de actividades/clientes devueltos."},
+            },
+            "required": ["representante", "fecha_desde", "fecha_hasta"],
+        },
+    },
+    "comercial_agente_clientes": {
+        "name": "comercial_agente_clientes",
+        "description": (
+            "Comercial/agentes. LECTURA. Ranking de clientes vendidos por un agente, "
+            "con venta neta, coste, margen, rentabilidad y actividades asociadas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_COMMERCIAL_AGENT_SCHEMA_PROPERTIES,
+                "limite_clientes": {"default": 20, "type": "integer", "description": "Maximo de clientes devueltos."},
+                "ordenar_por": {
+                    "default": "venta_neta",
+                    "enum": ["venta_neta", "coste", "margen", "rentabilidad_pct", "unidades", "lineas"],
+                    "type": "string",
+                },
+                "sentido": {"default": "desc", "enum": ["asc", "desc"], "type": "string"},
+            },
+            "required": ["representante", "fecha_desde", "fecha_hasta"],
+        },
+    },
+    "comercial_agente_productos": {
+        "name": "comercial_agente_productos",
+        "description": (
+            "Comercial/agentes. LECTURA. Ranking de productos vendidos por un agente, "
+            "con unidades, venta neta, coste, margen y rentabilidad."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_COMMERCIAL_AGENT_SCHEMA_PROPERTIES,
+                "limite_productos": {"default": 20, "type": "integer", "description": "Maximo de productos devueltos."},
+                "ordenar_por": {
+                    "default": "venta_neta",
+                    "enum": ["venta_neta", "coste", "margen", "rentabilidad_pct", "unidades", "lineas"],
+                    "type": "string",
+                },
+                "sentido": {"default": "desc", "enum": ["asc", "desc"], "type": "string"},
+            },
+            "required": ["representante", "fecha_desde", "fecha_hasta"],
+        },
+    },
+    "comercial_agente_analisis": {
+        "name": "comercial_agente_analisis",
+        "description": (
+            "Comercial/agentes. LECTURA. Analisis 360 de un agente: ventas, margen, "
+            "rentabilidad, actividades/visitas, clientes top y productos top."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_COMMERCIAL_AGENT_SCHEMA_PROPERTIES,
+                "limite_clientes": {"default": 10, "type": "integer"},
+                "limite_productos": {"default": 10, "type": "integer"},
+                "limite_actividades": {"default": 20, "type": "integer"},
+            },
+            "required": ["representante", "fecha_desde", "fecha_hasta"],
+        },
+    },
+})
 
 _DASHBOARD_ANALYTICS_SCHEMA: dict[str, Any] = {
     "type": "object",

@@ -17,14 +17,14 @@ class CleanupPhase10ProfilesTests(unittest.TestCase):
         server, definitions = self._surface("core")
         self.assertEqual(set(server.tools), set(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
         self.assertEqual(definitions, set(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
-        self.assertEqual(len(server.tools), 81)
+        self.assertEqual(len(server.tools), 85)
 
     def test_admin_is_core_plus_nine_admin_tools(self):
         server, definitions = self._surface("admin")
         expected = set(faro_mcp.CORE_PUBLIC_TOOL_NAMES | faro_mcp.ADMIN_PUBLIC_TOOL_NAMES)
         self.assertEqual(set(server.tools), expected)
         self.assertEqual(definitions, expected)
-        self.assertEqual(len(server.tools), 90)
+        self.assertEqual(len(server.tools), 94)
         self.assertTrue(faro_mcp.INTEGRATION_PUBLIC_TOOL_NAMES.isdisjoint(server.tools))
 
     def test_integrations_is_core_plus_integration_tools(self):
@@ -32,14 +32,14 @@ class CleanupPhase10ProfilesTests(unittest.TestCase):
         expected = set(faro_mcp.CORE_PUBLIC_TOOL_NAMES | faro_mcp.INTEGRATION_PUBLIC_TOOL_NAMES)
         self.assertEqual(set(server.tools), expected)
         self.assertEqual(definitions, expected)
-        self.assertEqual(len(server.tools), 82)
+        self.assertEqual(len(server.tools), 86)
         self.assertTrue(faro_mcp.ADMIN_PUBLIC_TOOL_NAMES.isdisjoint(server.tools))
 
     def test_all_exposes_complete_canonical_contract(self):
         server, definitions = self._surface("all")
         self.assertEqual(set(server.tools), set(faro_mcp.ALL_PUBLIC_TOOL_NAMES))
         self.assertEqual(definitions, set(faro_mcp.ALL_PUBLIC_TOOL_NAMES))
-        self.assertEqual(len(server.tools), 91)
+        self.assertEqual(len(server.tools), 95)
 
     def test_full_is_backwards_compatible_alias_for_all(self):
         server, definitions = self._surface("full")

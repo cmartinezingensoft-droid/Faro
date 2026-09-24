@@ -13,8 +13,8 @@ class CleanupPhase4ProfilesTests(unittest.TestCase):
             server = faro_mcp.FaroToolRuntime()
             definitions = {item["name"] for item in faro_mcp.tool_definitions()}
         self.assertEqual(server.tool_profile, "core")
-        self.assertEqual(len(server.tools), 81)
-        self.assertEqual(len(definitions), 81)
+        self.assertEqual(len(server.tools), 85)
+        self.assertEqual(len(definitions), 85)
         self.assertEqual(set(server.tools), definitions)
         self.assertTrue((faro_mcp.ADMIN_PUBLIC_TOOL_NAMES | faro_mcp.INTEGRATION_PUBLIC_TOOL_NAMES).isdisjoint(server.tools))
 
@@ -23,8 +23,8 @@ class CleanupPhase4ProfilesTests(unittest.TestCase):
             server = faro_mcp.FaroToolRuntime()
             definitions = {item["name"] for item in faro_mcp.tool_definitions()}
         self.assertEqual(server.tool_profile, "all")
-        self.assertEqual(len(server.tools), 91)
-        self.assertEqual(len(definitions), 91)
+        self.assertEqual(len(server.tools), 95)
+        self.assertEqual(len(definitions), 95)
         self.assertTrue((faro_mcp.ADMIN_PUBLIC_TOOL_NAMES | faro_mcp.INTEGRATION_PUBLIC_TOOL_NAMES).issubset(server.tools))
 
     def test_advanced_tools_are_not_callable_in_core(self):
@@ -50,7 +50,7 @@ class CleanupPhase4ProfilesTests(unittest.TestCase):
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "inventado"}):
             server = faro_mcp.FaroToolRuntime()
         self.assertEqual(server.tool_profile, "core")
-        self.assertEqual(len(server.tools), 81)
+        self.assertEqual(len(server.tools), 85)
 
 
 if __name__ == "__main__":

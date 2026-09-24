@@ -9,8 +9,8 @@ class CleanupPhase1PublicSurfaceTests(unittest.TestCase):
         server = faro_mcp.FaroToolRuntime()
         definitions = {item["name"] for item in faro_mcp.tool_definitions()}
 
-        self.assertEqual(len(server.tools), 81)
-        self.assertEqual(len(definitions), 81)
+        self.assertEqual(len(server.tools), 85)
+        self.assertEqual(len(definitions), 85)
         retired = {
             "busqueda_sql", "abrir_consulta", "ejecutar_sql",
             "inicializa_conexion", "echo_string", "reverse_string",

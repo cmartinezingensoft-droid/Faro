@@ -63,7 +63,7 @@ class Phase2EBillingTests(unittest.TestCase):
     def test_ticket_tool_registered_natively(self):
         server = faro_mcp.FaroToolRuntime()
         self.assertIn("mostrador_cobrar", server.tools)
-        self.assertEqual(len(server.tools), 81)
+        self.assertEqual(len(server.tools), 85)
         self.assertFalse(any(name.startswith("datasnap_") for name in server.tools))
 
     def test_spfechas_month_end_rule(self):
@@ -137,8 +137,8 @@ class Phase2EBillingTests(unittest.TestCase):
         captured = {}
         def insert_header(cbv):
             captured["cbv"] = cbv
-            cbv["CBV_NUMDOC"] = 90
-            return 90
+            cbv["CBV_NUMDOC"] = 94
+            return 94
         svc._insert_cabdocv_order = Mock(side_effect=insert_header)
         payments = []
         svc._insert_opecaj = Mock(side_effect=lambda opc: payments.append(dict(opc)) or len(payments))
@@ -148,7 +148,7 @@ class Phase2EBillingTests(unittest.TestCase):
         svc._finalizar_documento_venta = Mock(return_value={"totals": {"totals": Decimal("100"), "totald": Decimal("100")}, "efectos": 0, "riesgo": None})
         svc._print_ticket_best_effort = Mock(return_value={"intentada": False, "enviada": False})
         result = svc.save_ticket_invoice(1, "80", "30", "", "", "100", "", 7, 10, 0, "", "T", "u")
-        self.assertEqual(result["documento"], f"T-{date.today().year}-T-90")
+        self.assertEqual(result["documento"], f"T-{date.today().year}-T-94")
         self.assertEqual(payments[0]["OPC_IMPORT"], Decimal("70"))
         self.assertEqual(payments[1]["OPC_IMPORT"], Decimal("30"))
         self.assertEqual(captured["cbv"]["CBV_IMPCOB"], Decimal("100"))
