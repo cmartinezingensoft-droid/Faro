@@ -224,7 +224,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertIn("entrada_almacen_crear", core.tools)
         self.assertIn("orden_compra_cerrar", core.tools)
         self.assertNotIn("integracion_coinfer_stock", core.tools)
-        self.assertEqual(len(core.tools), 85)
+        self.assertEqual(len(core.tools), 87)
         self.assertFalse(any(name.startswith("datasnap_") for name in core.tools))
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "full"}):
             full = faro_mcp.FaroToolRuntime()

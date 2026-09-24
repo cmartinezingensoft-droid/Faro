@@ -6048,6 +6048,317 @@ class FaroPhase1Service:
             "productos_top": products["items"],
         }
 
+    def _commercial_activity_client_stats(self, args: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        codrep = int(args["representante"])
+        start = self._parse_optional_date(args.get("fecha_desde"))
+        end = self._parse_optional_date(args.get("fecha_hasta"))
+        if not start or not end:
+            raise FaroError("fecha_desde y fecha_hasta son obligatorias.")
+        if start > end:
+            raise FaroError("fecha_desde no puede ser posterior a fecha_hasta.")
+        activity_types = [int(value) for value in args.get("tipos_actividad") or []]
+        only_visits = bool(args.get("solo_visitas", False))
+
+        where = ["A.ACT_NUMEMP=?", "A.ACT_REPRES=?", "A.ACT_FECHA BETWEEN ? AND ?"]
+        params: list[Any] = [self.settings.empresa, codrep, start, end]
+        if activity_types:
+            where.append("A.ACT_CODACT IN (" + ",".join("?" for _ in activity_types) + ")")
+            params.extend(activity_types)
+
+        rows = self.db.fetch_all(
+            f"""
+            SELECT A.ACT_CODCLI, A.ACT_SUBCLI, A.ACT_CODACT, A.ACT_FECHA, T.TAC_DESCRI, C.CLI_NOMCLI
+            FROM ACTIVI A
+            LEFT JOIN TIPACT T ON T.TAC_NUMEMP=A.ACT_NUMEMP AND T.TAC_CODIGO=A.ACT_CODACT
+            LEFT JOIN CLIEN C ON C.CLI_NUMEMP=A.ACT_NUMEMP
+                AND C.CLI_CODCLI=A.ACT_CODCLI AND C.CLI_SUBCLI=A.ACT_SUBCLI
+            WHERE {" AND ".join(where)}
+            ORDER BY A.ACT_FECHA DESC
+            """,
+            tuple(params),
+        )
+
+        stats: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            type_name = clean_text_value(row.get("TAC_DESCRI"))
+            is_visit = "VISIT" in type_name.upper()
+            if only_visits and not is_visit:
+                continue
+            counts_as_visit = is_visit or not only_visits
+            client_code = int(row.get("ACT_CODCLI") or 0)
+            subclient_code = int(row.get("ACT_SUBCLI") or 0)
+            key = f"{client_code}/{subclient_code}"
+            if key not in stats:
+                stats[key] = {
+                    "codigo": key,
+                    "cliente": client_code,
+                    "subcliente": subclient_code,
+                    "nombre": clean_text_value(row.get("CLI_NOMCLI")),
+                    "actividades": 0,
+                    "visitas": 0,
+                    "ultima_actividad": None,
+                    "ultima_visita": None,
+                    "tipos_actividad": {},
+                }
+            item = stats[key]
+            item["actividades"] += 1
+            if counts_as_visit:
+                item["visitas"] += 1
+            activity_date = self._parse_optional_date(row.get("ACT_FECHA"))
+            if activity_date is not None:
+                current_activity = self._parse_optional_date(item.get("ultima_actividad"))
+                if current_activity is None or activity_date > current_activity:
+                    item["ultima_actividad"] = activity_date.isoformat()
+                if counts_as_visit:
+                    current_visit = self._parse_optional_date(item.get("ultima_visita"))
+                    if current_visit is None or activity_date > current_visit:
+                        item["ultima_visita"] = activity_date.isoformat()
+            type_code = int(row.get("ACT_CODACT") or 0)
+            type_key = str(type_code)
+            if type_key not in item["tipos_actividad"]:
+                item["tipos_actividad"][type_key] = {"codigo": type_code, "nombre": type_name, "actividades": 0}
+            item["tipos_actividad"][type_key]["actividades"] += 1
+
+        for item in stats.values():
+            item["tipos_actividad"] = sorted(
+                item["tipos_actividad"].values(),
+                key=lambda value: int(value["actividades"]),
+                reverse=True,
+            )
+        return stats
+
+    @staticmethod
+    def _commercial_ratio(amount: Decimal, count: int) -> Decimal:
+        return amount / Decimal(count) if count else Decimal("0")
+
+    @staticmethod
+    def _commercial_sales_client_parts(code: str) -> tuple[int, int]:
+        raw_client, _, raw_subclient = str(code or "0/0").partition("/")
+        return int(raw_client or 0), int(raw_subclient or 0)
+
+    @staticmethod
+    def _commercial_comparison_sort_value(item: dict[str, Any], order_by: str) -> Decimal:
+        if order_by in {"visitas", "actividades", "ventas_lineas", "dias_desde_ultima_visita"}:
+            return Decimal(item.get(order_by) or 0)
+        return dec(item.get(order_by))
+
+    def _commercial_classification(
+        self,
+        item: dict[str, Any],
+        avg_sale_per_visit: Decimal,
+        avg_sale_per_client: Decimal,
+        avg_margin_per_client: Decimal,
+        high_visit_threshold: int,
+        low_visit_threshold: int,
+    ) -> str:
+        visits = int(item["visitas"])
+        sale = dec(item["venta_neta"])
+        margin = dec(item["margen"])
+        sale_per_visit = dec(item["venta_por_visita"])
+        if sale <= 0 and visits > 0:
+            return "visitado_sin_venta" if visits < high_visit_threshold else "sobrevisitado"
+        if sale > 0 and visits == 0:
+            return "sin_visitas_con_venta"
+        if visits >= high_visit_threshold and avg_sale_per_visit > 0 and sale_per_visit < avg_sale_per_visit * Decimal("0.50"):
+            return "sobrevisitado"
+        if visits <= low_visit_threshold and sale > 0 and (sale >= avg_sale_per_client or margin >= avg_margin_per_client):
+            return "alto_valor_poco_visitado"
+        return "equilibrado"
+
+    def commercial_agent_visit_sales_clients(self, args: dict[str, Any]) -> dict[str, Any]:
+        codrep = int(args["representante"])
+        end = self._parse_optional_date(args.get("fecha_hasta"))
+        if end is None:
+            raise FaroError("fecha_hasta es obligatoria.")
+        sales_args = self._commercial_common_sales_args(args)
+        sales_args.update({
+            "agrupar_por": "cliente",
+            "ordenar_por": "venta_neta",
+            "sentido": "desc",
+            "limite_grupos": args.get("limite_clientes_base", 5000),
+        })
+        sales = self.sales_profit_summary(sales_args)
+        activities = self._commercial_activity_client_stats(args)
+
+        clients: dict[str, dict[str, Any]] = {}
+        for item in sales["items"]:
+            client, subclient = self._commercial_sales_client_parts(str(item.get("codigo")))
+            clients[str(item["codigo"])] = {
+                "codigo": str(item["codigo"]),
+                "cliente": client,
+                "subcliente": subclient,
+                "nombre": clean_text_value(item.get("nombre")),
+                "ventas_lineas": int(item.get("lineas") or 0),
+                "unidades": dec(item.get("unidades")),
+                "venta_neta": dec(item.get("venta_neta")),
+                "coste": dec(item.get("coste")),
+                "margen": dec(item.get("margen")),
+                "rentabilidad_pct": dec(item.get("rentabilidad_pct")),
+            }
+        for key, activity in activities.items():
+            if key not in clients:
+                clients[key] = {
+                    "codigo": key,
+                    "cliente": activity["cliente"],
+                    "subcliente": activity["subcliente"],
+                    "nombre": activity["nombre"],
+                    "ventas_lineas": 0,
+                    "unidades": Decimal("0"),
+                    "venta_neta": Decimal("0"),
+                    "coste": Decimal("0"),
+                    "margen": Decimal("0"),
+                    "rentabilidad_pct": Decimal("0"),
+                }
+
+        total_visits = sum(int(item.get("visitas") or 0) for item in activities.values())
+        sale_total = dec(sales["totales"].get("venta_neta"))
+        margin_total = dec(sales["totales"].get("margen"))
+        customers_with_sales = [item for item in clients.values() if dec(item["venta_neta"]) > 0]
+        avg_sale_per_client = sale_total / Decimal(len(customers_with_sales)) if customers_with_sales else Decimal("0")
+        avg_margin_per_client = margin_total / Decimal(len(customers_with_sales)) if customers_with_sales else Decimal("0")
+        avg_sale_per_visit = self._commercial_ratio(sale_total, total_visits)
+        high_visit_threshold = max(1, int(args.get("visitas_alta_desde", 4) or 4))
+        low_visit_threshold = max(0, int(args.get("visitas_baja_hasta", 1) or 1))
+
+        result_items: list[dict[str, Any]] = []
+        for key, item in clients.items():
+            activity = activities.get(key, {})
+            visits = int(activity.get("visitas") or 0)
+            activity_count = int(activity.get("actividades") or 0)
+            last_visit = activity.get("ultima_visita")
+            last_visit_date = self._parse_optional_date(last_visit)
+            days_since_last_visit = (end - last_visit_date).days if last_visit_date else None
+            sale = dec(item["venta_neta"])
+            margin = dec(item["margen"])
+            sale_per_visit = self._commercial_ratio(sale, visits)
+            margin_per_visit = self._commercial_ratio(margin, visits)
+            enriched = {
+                "codigo": key,
+                "cliente": item["cliente"],
+                "subcliente": item["subcliente"],
+                "nombre": item["nombre"],
+                "visitas": visits,
+                "actividades": activity_count,
+                "ultima_visita": last_visit,
+                "ultima_actividad": activity.get("ultima_actividad"),
+                "dias_desde_ultima_visita": days_since_last_visit,
+                "tipos_actividad": activity.get("tipos_actividad", []),
+                "ventas_lineas": item["ventas_lineas"],
+                "unidades": normalize(item["unidades"]),
+                "venta_neta": normalize(sale),
+                "coste": normalize(item["coste"]),
+                "margen": normalize(margin),
+                "rentabilidad_pct": normalize(item["rentabilidad_pct"]),
+                "venta_por_visita": normalize(sale_per_visit),
+                "margen_por_visita": normalize(margin_per_visit),
+            }
+            enriched["clasificacion"] = self._commercial_classification(
+                enriched,
+                avg_sale_per_visit,
+                avg_sale_per_client,
+                avg_margin_per_client,
+                high_visit_threshold,
+                low_visit_threshold,
+            )
+            result_items.append(enriched)
+
+        order_by = str(args.get("ordenar_por", "venta_por_visita") or "venta_por_visita").strip().lower()
+        allowed = {
+            "venta_por_visita", "margen_por_visita", "visitas", "actividades", "venta_neta",
+            "margen", "rentabilidad_pct", "ventas_lineas", "dias_desde_ultima_visita",
+        }
+        if order_by not in allowed:
+            raise FaroError("ordenar_por no soportado.")
+        reverse = str(args.get("sentido", "desc") or "desc").strip().lower() != "asc"
+        result_items.sort(key=lambda value: self._commercial_comparison_sort_value(value, order_by), reverse=reverse)
+        limit = max(1, min(int(args.get("limite_clientes", 100) or 100), 1000))
+        result_items = result_items[:limit]
+
+        customers_visited = {key for key, item in activities.items() if int(item.get("visitas") or 0) > 0}
+        customers_sold = {key for key, item in clients.items() if dec(item["venta_neta"]) > 0}
+        visited_with_sales = customers_visited & customers_sold
+        return {
+            "representante": self.representative_info(codrep),
+            "fecha_desde": args.get("fecha_desde"),
+            "fecha_hasta": args.get("fecha_hasta"),
+            "ordenar_por": order_by,
+            "sentido": "desc" if reverse else "asc",
+            "criterios": {
+                "solo_visitas": bool(args.get("solo_visitas", False)),
+                "tipos_actividad": args.get("tipos_actividad") or [],
+                "visitas_alta_desde": high_visit_threshold,
+                "visitas_baja_hasta": low_visit_threshold,
+            },
+            "resumen": {
+                "clientes_analizados": len(clients),
+                "clientes_con_ventas": len(customers_sold),
+                "clientes_visitados": len(customers_visited),
+                "clientes_visitados_con_venta": len(visited_with_sales),
+                "clientes_visitados_sin_venta": len(customers_visited - customers_sold),
+                "clientes_con_venta_sin_visita": len(customers_sold - customers_visited),
+                "visitas_total": total_visits,
+                "actividades_total": sum(int(item.get("actividades") or 0) for item in activities.values()),
+                "venta_neta_total": normalize(sale_total),
+                "margen_total": normalize(margin_total),
+                "venta_por_visita": normalize(avg_sale_per_visit),
+                "margen_por_visita": normalize(self._commercial_ratio(margin_total, total_visits)),
+                "conversion_clientes_visitados_pct": normalize(
+                    Decimal(len(visited_with_sales)) * Decimal("100") / Decimal(len(customers_visited))
+                    if customers_visited else Decimal("0")
+                ),
+                "cobertura_clientes_vendidos_pct": normalize(
+                    Decimal(len(visited_with_sales)) * Decimal("100") / Decimal(len(customers_sold))
+                    if customers_sold else Decimal("0")
+                ),
+            },
+            "count": len(result_items),
+            "items": result_items,
+        }
+
+    def commercial_agent_visit_sales_opportunities(self, args: dict[str, Any]) -> dict[str, Any]:
+        comparison = self.commercial_agent_visit_sales_clients({
+            **args,
+            "limite_clientes": args.get("limite_base", 1000),
+        })
+        per_bucket_limit = max(1, min(int(args.get("limite_por_categoria", 20) or 20), 200))
+        buckets = {
+            "sobrevisitados": [],
+            "alto_valor_poco_visitado": [],
+            "sin_visitas_con_venta": [],
+            "visitados_sin_venta": [],
+            "equilibrados": [],
+        }
+        for item in comparison["items"]:
+            classification = item.get("clasificacion")
+            if classification == "sobrevisitado":
+                buckets["sobrevisitados"].append(item)
+            elif classification == "alto_valor_poco_visitado":
+                buckets["alto_valor_poco_visitado"].append(item)
+            elif classification == "sin_visitas_con_venta":
+                buckets["sin_visitas_con_venta"].append(item)
+            elif classification == "visitado_sin_venta":
+                buckets["visitados_sin_venta"].append(item)
+            else:
+                buckets["equilibrados"].append(item)
+
+        buckets["sobrevisitados"].sort(key=lambda item: (int(item["visitas"]), -dec(item["venta_neta"])), reverse=True)
+        buckets["alto_valor_poco_visitado"].sort(key=lambda item: dec(item["margen"]), reverse=True)
+        buckets["sin_visitas_con_venta"].sort(key=lambda item: dec(item["venta_neta"]), reverse=True)
+        buckets["visitados_sin_venta"].sort(key=lambda item: int(item["visitas"]), reverse=True)
+        buckets["equilibrados"].sort(key=lambda item: dec(item["venta_neta"]), reverse=True)
+
+        return {
+            "representante": comparison["representante"],
+            "fecha_desde": comparison["fecha_desde"],
+            "fecha_hasta": comparison["fecha_hasta"],
+            "resumen": comparison["resumen"],
+            "criterios": comparison["criterios"],
+            "oportunidades": {
+                key: {"count": len(value), "items": value[:per_bucket_limit]}
+                for key, value in buckets.items()
+            },
+        }
+
     def parameter(self, code: str, default: str = "") -> str:
         row = self.db.fetch_one(
             "SELECT PAR_VALOR FROM PARAMETROS WHERE PAR_NUMEMP=? AND PAR_CODIGO=?",
@@ -14041,6 +14352,8 @@ CORE_PUBLIC_TOOL_NAMES = frozenset({
     "comercial_agente_analisis",
     "comercial_agente_clientes",
     "comercial_agente_productos",
+    "comercial_agente_visitas_ventas_clientes",
+    "comercial_agente_visitas_ventas_oportunidades",
     # Stock / almacen.
     "stock_consultar",
     "stock_regularizar",
@@ -14211,6 +14524,8 @@ READ_ONLY_TOOL_NAMES = frozenset({
     "comercial_agente_analisis",
     "comercial_agente_clientes",
     "comercial_agente_productos",
+    "comercial_agente_visitas_ventas_clientes",
+    "comercial_agente_visitas_ventas_oportunidades",
     "entrada_pedidos_relacionados",
     "integracion_coinfer_stock",
     "pedido_detalle",
@@ -14543,6 +14858,8 @@ class FaroToolRuntime:
             'comercial_agente_analisis': self.tool_comercial_agente_analisis,
             'comercial_agente_clientes': self.tool_comercial_agente_clientes,
             'comercial_agente_productos': self.tool_comercial_agente_productos,
+            'comercial_agente_visitas_ventas_clientes': self.tool_comercial_agente_visitas_ventas_clientes,
+            'comercial_agente_visitas_ventas_oportunidades': self.tool_comercial_agente_visitas_ventas_oportunidades,
             'compras_articulos_pendientes_recibir': self.tool_compras_articulos_pendientes_recibir,
             'compras_documentos_pendientes_resumen': self.tool_compras_documentos_pendientes_resumen,
             'compras_pedidos_pendientes_resumen': self.tool_compras_pedidos_pendientes_resumen,
@@ -15740,6 +16057,20 @@ class FaroToolRuntime:
         svc = self.phase1_service()
         try:
             return svc.commercial_agent_analysis(args)
+        finally:
+            svc.db.close()
+
+    def tool_comercial_agente_visitas_ventas_clientes(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.commercial_agent_visit_sales_clients(args)
+        finally:
+            svc.db.close()
+
+    def tool_comercial_agente_visitas_ventas_oportunidades(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.commercial_agent_visit_sales_opportunities(args)
         finally:
             svc.db.close()
 
@@ -17206,6 +17537,35 @@ _COMMERCIAL_AGENT_SCHEMA_PROPERTIES: dict[str, Any] = {
     },
 }
 
+_COMMERCIAL_VISIT_SALES_SCHEMA_PROPERTIES: dict[str, Any] = {
+    **_COMMERCIAL_AGENT_SCHEMA_PROPERTIES,
+    "solo_visitas": {
+        "default": False,
+        "type": "boolean",
+        "description": "Si es true, solo cruza actividades cuyo tipo contenga VISIT en TIPACT.TAC_DESCRI.",
+    },
+    "tipos_actividad": {
+        "items": {"type": "integer"},
+        "type": "array",
+        "description": "Codigos de TIPACT que se deben considerar como actividad/visita.",
+    },
+    "visitas_alta_desde": {
+        "default": 4,
+        "type": "integer",
+        "description": "Numero de visitas desde el que un cliente puede considerarse sobrevisitado.",
+    },
+    "visitas_baja_hasta": {
+        "default": 1,
+        "type": "integer",
+        "description": "Numero de visitas hasta el que un cliente puede considerarse poco visitado.",
+    },
+    "limite_clientes_base": {
+        "default": 5000,
+        "type": "integer",
+        "description": "Maximo de clientes de venta base a cruzar antes de ordenar el resultado final.",
+    },
+}
+
 _INTERNAL_TOOL_DEFINITIONS.update({
     "comercial_agente_actividades": {
         "name": "comercial_agente_actividades",
@@ -17279,6 +17639,54 @@ _INTERNAL_TOOL_DEFINITIONS.update({
                 "limite_clientes": {"default": 10, "type": "integer"},
                 "limite_productos": {"default": 10, "type": "integer"},
                 "limite_actividades": {"default": 20, "type": "integer"},
+            },
+            "required": ["representante", "fecha_desde", "fecha_hasta"],
+        },
+    },
+    "comercial_agente_visitas_ventas_clientes": {
+        "name": "comercial_agente_visitas_ventas_clientes",
+        "description": (
+            "Comercial/agentes. LECTURA. Cruza ventas/rentabilidad y visitas por cliente "
+            "para detectar sobrevisita, clientes que venden sin visita y relacion venta/visita."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_COMMERCIAL_VISIT_SALES_SCHEMA_PROPERTIES,
+                "limite_clientes": {"default": 100, "type": "integer", "description": "Maximo de clientes devueltos."},
+                "ordenar_por": {
+                    "default": "venta_por_visita",
+                    "enum": [
+                        "venta_por_visita", "margen_por_visita", "visitas", "actividades", "venta_neta",
+                        "margen", "rentabilidad_pct", "ventas_lineas", "dias_desde_ultima_visita",
+                    ],
+                    "type": "string",
+                },
+                "sentido": {"default": "desc", "enum": ["asc", "desc"], "type": "string"},
+            },
+            "required": ["representante", "fecha_desde", "fecha_hasta"],
+        },
+    },
+    "comercial_agente_visitas_ventas_oportunidades": {
+        "name": "comercial_agente_visitas_ventas_oportunidades",
+        "description": (
+            "Comercial/agentes. LECTURA. Clasifica clientes del agente por oportunidad/riesgo: "
+            "sobrevisitados, alto valor poco visitado, venta sin visita y visitas sin venta."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **_COMMERCIAL_VISIT_SALES_SCHEMA_PROPERTIES,
+                "limite_base": {
+                    "default": 1000,
+                    "type": "integer",
+                    "description": "Maximo de clientes analizados antes de clasificar oportunidades.",
+                },
+                "limite_por_categoria": {
+                    "default": 20,
+                    "type": "integer",
+                    "description": "Maximo de clientes devueltos por cada bloque de oportunidad.",
+                },
             },
             "required": ["representante", "fecha_desde", "fecha_hasta"],
         },

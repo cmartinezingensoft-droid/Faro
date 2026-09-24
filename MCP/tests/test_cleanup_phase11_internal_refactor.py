@@ -8,7 +8,7 @@ import faro_mcp
 from tests._runtime_compat import legacy_handle_for_test
 
 
-PHASE12_ALL_SCHEMA_SHA256 = "8fb2265fc7a1d5c0ffb808b5b18a77b7ee165eb20724414721b228806e6a095f"
+PHASE12_ALL_SCHEMA_SHA256 = "b258f79f7b0a835463cb9611e889eef3135aea0663d714a17ec20330ea36409d"
 # Hash actualizado de forma intencional:
 # 1) al permitir que stock_trasvasar reciba lineas con solo articulo+cantidad
 #    (descripcion/unidad_medida se autocompletan desde ARTICUL si se dejan
@@ -100,7 +100,7 @@ class CleanupPhase11InternalRefactorTests(unittest.TestCase):
     def test_public_handlers_use_canonical_method_names(self):
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "all"}):
             server = faro_mcp.FaroToolRuntime()
-        self.assertEqual(len(server.tools), 95)
+        self.assertEqual(len(server.tools), 97)
         for name, handler in server.tools.items():
             with self.subTest(name=name):
                 self.assertEqual(handler.__name__, f"tool_{name}")
@@ -121,7 +121,7 @@ class CleanupPhase11InternalRefactorTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(payload).hexdigest(), PHASE12_ALL_SCHEMA_SHA256)
 
     def test_profiles_keep_frozen_counts(self):
-        expected = {"core": 85, "admin": 94, "integrations": 86, "all": 95, "full": 95}
+        expected = {"core": 87, "admin": 96, "integrations": 88, "all": 97, "full": 97}
         for profile, count in expected.items():
             with self.subTest(profile=profile), patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": profile}):
                 server = faro_mcp.FaroToolRuntime()

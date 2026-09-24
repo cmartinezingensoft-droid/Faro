@@ -45,7 +45,7 @@ class Phase2DTests(unittest.TestCase):
         self.assertIn("mostrador_venta_gestion", server.tools)
         self.assertNotIn("mostrador_pedido_cargar", server.tools)
         self.assertIn("venta_documento_crear", server.tools)
-        self.assertEqual(len(server.tools), 85)
+        self.assertEqual(len(server.tools), 87)
         self.assertFalse(any(name.startswith("datasnap_") for name in server.tools))
 
     def test_parse_document_line_matches_14_field_protocol(self):

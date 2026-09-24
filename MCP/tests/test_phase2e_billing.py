@@ -63,7 +63,7 @@ class Phase2EBillingTests(unittest.TestCase):
     def test_ticket_tool_registered_natively(self):
         server = faro_mcp.FaroToolRuntime()
         self.assertIn("mostrador_cobrar", server.tools)
-        self.assertEqual(len(server.tools), 85)
+        self.assertEqual(len(server.tools), 87)
         self.assertFalse(any(name.startswith("datasnap_") for name in server.tools))
 
     def test_spfechas_month_end_rule(self):

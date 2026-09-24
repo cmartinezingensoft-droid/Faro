@@ -14,10 +14,10 @@ class CleanupPhase9SalesCounterTests(unittest.TestCase):
             full = faro_mcp.FaroToolRuntime()
             full_defs = {item["name"] for item in faro_mcp.tool_definitions()}
 
-        self.assertEqual(len(core.tools), 85)
-        self.assertEqual(len(core_defs), 85)
-        self.assertEqual(len(full.tools), 95)
-        self.assertEqual(len(full_defs), 95)
+        self.assertEqual(len(core.tools), 87)
+        self.assertEqual(len(core_defs), 87)
+        self.assertEqual(len(full.tools), 97)
+        self.assertEqual(len(full_defs), 97)
         for server in (core, full):
             self.assertIn("mostrador_venta_gestion", server.tools)
             self.assertIn("mostrador_cobrar", server.tools)

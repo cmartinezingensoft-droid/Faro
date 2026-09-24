@@ -161,7 +161,7 @@ class Phase2CSalesTests(unittest.TestCase):
         self.assertIn("mostrador_venta_gestion", server.tools)
         self.assertNotIn("mostrador_venta_guardar", server.tools)
         self.assertNotIn("mostrador_venta_borrar", server.tools)
-        self.assertEqual(len(server.tools), 85)
+        self.assertEqual(len(server.tools), 87)
         self.assertFalse(any(name.startswith("datasnap_") for name in server.tools))
 
     def test_bloqueo_vencaj_available_and_blocked(self):

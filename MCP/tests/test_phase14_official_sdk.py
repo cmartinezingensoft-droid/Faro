@@ -129,7 +129,7 @@ class Phase14OfficialSdkTests(unittest.TestCase):
         self.assertTrue(callable(server.kwargs["on_call_tool"]))
 
         result = asyncio.run(server.kwargs["on_list_tools"](SimpleNamespace(), None))
-        self.assertEqual(len(result.tools), 85)
+        self.assertEqual(len(result.tools), 87)
         self.assertEqual(
             {tool.name for tool in result.tools},
             {item["name"] for item in faro_mcp.tool_definitions("core")},
@@ -199,10 +199,10 @@ class Phase14OfficialSdkTests(unittest.TestCase):
     def test_runtime_version_and_contract_stay_separate(self):
         self.assertEqual(faro_mcp.SERVER_VERSION, "2.15.8")
         self.assertEqual(faro_mcp.PUBLIC_CONTRACT_VERSION, "2.0")
-        self.assertEqual(len(faro_mcp.tool_definitions("core")), 85)
-        self.assertEqual(len(faro_mcp.tool_definitions("admin")), 94)
-        self.assertEqual(len(faro_mcp.tool_definitions("integrations")), 86)
-        self.assertEqual(len(faro_mcp.tool_definitions("all")), 95)
+        self.assertEqual(len(faro_mcp.tool_definitions("core")), 87)
+        self.assertEqual(len(faro_mcp.tool_definitions("admin")), 96)
+        self.assertEqual(len(faro_mcp.tool_definitions("integrations")), 88)
+        self.assertEqual(len(faro_mcp.tool_definitions("all")), 97)
 
 
 if __name__ == "__main__":
