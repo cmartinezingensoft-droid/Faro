@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard ERP · Acciones MCP</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --ink: #18242f;
+      --muted: #5f6f7f;
+      --line: #d9e1e8;
+      --blue: #245fc7;
+      --green: #17745f;
+      --red: #c93535;
+      --amber: #b96b00;
+      --purple: #6a4ab0;
+      --shadow: 0 8px 24px rgba(18, 31, 45, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .topbar {
+      max-width: 1260px;
+      margin: 0 auto;
+      padding: 18px 22px 14px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+    }
+
+    h1 {
+      margin: 0 0 5px;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+
+    .sub {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .nav {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .nav a, .link-btn {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--ink);
+      background: #fbfcfd;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .nav a:hover, .link-btn:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    main {
+      max-width: 1260px;
+      margin: 0 auto;
+      padding: 22px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 18px;
+      align-items: start;
+      margin-bottom: 18px;
+    }
+
+    .panel, .kpi, .area-card, .action-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .panel { padding: 18px; }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .kpi {
+      padding: 15px;
+      min-height: 104px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    .value {
+      font-size: 32px;
+      line-height: 1;
+      font-weight: 800;
+    }
+
+    .hint {
+      margin-top: 9px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 18px;
+    }
+
+    h3 {
+      margin: 0 0 6px;
+      font-size: 16px;
+    }
+
+    .bars {
+      display: grid;
+      gap: 11px;
+    }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: 98px 1fr 40px;
+      gap: 10px;
+      align-items: center;
+      font-size: 13px;
+    }
+
+    .bar-track {
+      height: 14px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #edf2f6;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: var(--blue);
+    }
+
+    .area-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }
+
+    .area-card {
+      display: block;
+      padding: 15px;
+      color: inherit;
+      text-decoration: none;
+      min-height: 132px;
+    }
+
+    .area-card:hover {
+      border-color: var(--blue);
+    }
+
+    .area-card .count {
+      font-size: 28px;
+      font-weight: 800;
+      margin: 8px 0;
+    }
+
+    .section {
+      scroll-margin-top: 98px;
+      margin-top: 18px;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .section-head p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .actions {
+      display: grid;
+      gap: 10px;
+    }
+
+    .action-card {
+      display: grid;
+      grid-template-columns: 46px 1fr minmax(115px, auto);
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+    }
+
+    .score {
+      width: 42px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--red);
+      color: #fff;
+      font-weight: 800;
+      font-size: 14px;
+    }
+
+    .score.medium { background: var(--amber); }
+    .score.low { background: var(--green); }
+
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .amount {
+      justify-self: end;
+      text-align: right;
+      color: var(--amber);
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .amount span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 400;
+      margin-top: 3px;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      color: #fff;
+      background: var(--red);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .pill.blue { background: var(--blue); }
+    .pill.green { background: var(--green); }
+    .pill.amber { background: var(--amber); }
+    .pill.purple { background: var(--purple); }
+
+    .tool {
+      margin-top: 6px;
+      font-family: Consolas, "Courier New", monospace;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      margin: 12px 0 0;
+    }
+
+    .quick-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    @media (max-width: 1020px) {
+      .hero-grid, .split, .area-grid { grid-template-columns: 1fr; }
+      .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .topbar { grid-template-columns: 1fr; }
+      .nav { justify-content: flex-start; }
+    }
+
+    @media (max-width: 680px) {
+      main { padding: 14px; }
+      .kpis { grid-template-columns: 1fr; }
+      .action-card { grid-template-columns: 42px 1fr; }
+      .amount { grid-column: 2; justify-self: start; text-align: left; }
+      .bar-row { grid-template-columns: 82px 1fr 34px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <div>
+        <h1>Dashboard ERP · acciones recomendadas</h1>
+        <p class="sub">Datos reales desde MCP Faro · 2026-09-01 a 2026-09-22 · lectura sin mutaciones</p>
+      </div>
+      <nav class="nav" aria-label="Areas del dashboard">
+        <a href="#ventas">Ventas</a>
+        <a href="#clientes">Clientes</a>
+        <a href="#stock">Stock</a>
+        <a href="#pendientes">Pendientes</a>
+        <a href="#tesoreria">Tesoreria</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="kpis" id="resumen">
+      <article class="kpi">
+        <div class="label">Acciones detectadas</div>
+        <div class="value">54</div>
+        <div class="hint">Top global compuesto por la herramienta principal.</div>
+      </article>
+      <article class="kpi">
+        <div class="label">Acciones devueltas</div>
+        <div class="value">12</div>
+        <div class="hint">Limite aplicado para la bandeja ejecutiva.</div>
+      </article>
+      <article class="kpi">
+        <div class="label">Area dominante</div>
+        <div class="value">Stock</div>
+        <div class="hint">El valor inmovilizado copa el ranking global.</div>
+      </article>
+      <article class="kpi">
+        <div class="label">Prioridad maxima</div>
+        <div class="value">100</div>
+        <div class="hint">Severidad alta por impacto economico.</div>
+      </article>
+    </section>
+
+    <section class="hero-grid">
+      <article class="panel">
+        <h2>Mapa de acciones por area</h2>
+        <div class="bars">
+          <div class="bar-row"><a href="#tesoreria">Tesoreria</a><div class="bar-track"><div class="bar-fill" style="width: 100%"></div></div><b>58</b></div>
+          <div class="bar-row"><a href="#stock">Stock</a><div class="bar-track"><div class="bar-fill" style="width: 62%"></div></div><b>36</b></div>
+          <div class="bar-row"><a href="#ventas">Ventas</a><div class="bar-track"><div class="bar-fill" style="width: 21%"></div></div><b>12</b></div>
+          <div class="bar-row"><a href="#clientes">Clientes</a><div class="bar-track"><div class="bar-fill" style="width: 21%"></div></div><b>12</b></div>
+          <div class="bar-row"><a href="#pendientes">Pendientes</a><div class="bar-track"><div class="bar-fill" style="width: 10%"></div></div><b>6</b></div>
+        </div>
+        <p class="note">Los enlaces llevan a la lista concreta de acciones por dominio. En una version viva, cada enlace llamaria a su herramienta MCP especializada.</p>
+      </article>
+
+      <article class="panel">
+        <h2>Bandeja ejecutiva</h2>
+        <div class="actions">
+          <div class="action-card"><div class="score">100</div><div><h3>SEMIMASCARA HM501B M</h3><div class="meta">stock_parado · sin ventas en el periodo · proveedor HONEYWELL</div><div class="tool">stock_acciones_recomendadas</div></div><div class="amount">7.294,00<span>valor stock</span></div></div>
+          <div class="action-card"><div class="score">100</div><div><h3>GAFA AVATAR RX ROJA CLEAR HC</h3><div class="meta">stock_parado · 606 unidades · sin rotacion</div><div class="tool">stock_acciones_recomendadas</div></div><div class="amount">7.246,12<span>valor stock</span></div></div>
+          <div class="action-card"><div class="score">100</div><div><h3>Pedido pendiente</h3><div class="meta">60 documentos pendientes de revisar</div><div class="tool">pedidos_acciones_recomendadas</div></div><div class="amount">39.704,28<span>pendiente</span></div></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="area-grid" aria-label="Enlaces rapidos por area">
+      <a class="area-card" href="#ventas"><span class="pill blue">Ventas</span><div class="count">12</div><div class="meta">Margen negativo en articulos inventariables.</div></a>
+      <a class="area-card" href="#clientes"><span class="pill green">Clientes</span><div class="count">12</div><div class="meta">Clientes que desaparecen o deterioran margen.</div></a>
+      <a class="area-card" href="#stock"><span class="pill">Stock</span><div class="count">36</div><div class="meta">Inmovilizado, baja rotacion y compra sin salida.</div></a>
+      <a class="area-card" href="#pendientes"><span class="pill amber">Pendientes</span><div class="count">6</div><div class="meta">Pedidos, presupuestos y documentos pendientes.</div></a>
+      <a class="area-card" href="#tesoreria"><span class="pill purple">Tesoreria</span><div class="count">58</div><div class="meta">Operaciones de caja revisables.</div></a>
+    </section>
+
+    <section class="section panel" id="ventas">
+      <div class="section-head">
+        <div>
+          <h2>Ventas · acciones recomendadas</h2>
+          <p>Origen MCP: <strong>ventas_acciones_recomendadas</strong>. Detecta lineas con margen negativo, excluyendo conceptos no inventariables como PORTES del coste de articulo.</p>
+        </div>
+        <a class="link-btn" href="#resumen">Subir</a>
+      </div>
+      <div class="actions">
+        <div class="action-card"><div class="score medium">76</div><div><h3>ZAPATO LORAS S1P ESD T-39</h3><div class="meta">UPRT20086-39 · venta 29,75 · coste 58,14 · margen -28,39</div><div class="tool">Accion: revisar tarifa y coste aplicado.</div></div><div class="amount">-95,43%<span>rentabilidad</span></div></div>
+        <div class="action-card"><div class="score medium">75</div><div><h3>CAJA 100 GUANTES LATEX T-M</h3><div class="meta">731670001 · venta 6,90 · coste 15,18 · margen -8,28</div><div class="tool">Accion: revisar coste, precio o descuentos.</div></div><div class="amount">-120,04%<span>rentabilidad</span></div></div>
+        <div class="action-card"><div class="score medium">75</div><div><h3>CAJA 100 GUANTES LATEX T-L</h3><div class="meta">731670002 · venta 6,90 · coste 15,18 · margen -8,28</div><div class="tool">Accion: revisar coste, precio o descuentos.</div></div><div class="amount">-120,04%<span>rentabilidad</span></div></div>
+      </div>
+      <div class="quick-links">
+        <a class="link-btn" href="#clientes">Ver clientes</a>
+        <a class="link-btn" href="#stock">Ver stock relacionado</a>
+        <a class="link-btn" href="#pendientes">Ver pendientes</a>
+      </div>
+    </section>
+
+    <section class="section panel" id="clientes">
+      <div class="section-head">
+        <div>
+          <h2>Clientes · acciones recomendadas</h2>
+          <p>Origen MCP: <strong>clientes_acciones_recomendadas</strong>. Senala clientes con compra anterior y cero compra actual.</p>
+        </div>
+        <a class="link-btn" href="#resumen">Subir</a>
+      </div>
+      <div class="actions">
+        <div class="action-card"><div class="score low">60</div><div><h3>XEFFER</h3><div class="meta">cliente_desaparece · venta actual 0 · venta comparativa 4,81</div><div class="tool">Accion: contactar cliente y revisar articulos o familias compradas antes.</div></div><div class="amount">-100%<span>venta</span></div></div>
+        <div class="action-card"><div class="score low">60</div><div><h3>BRISA PVC PROFESIONAL S.L.U.</h3><div class="meta">cliente_desaparece · venta actual 0 · venta comparativa 114,29</div><div class="tool">Accion: seguimiento comercial.</div></div><div class="amount">-100%<span>venta</span></div></div>
+        <div class="action-card"><div class="score low">60</div><div><h3>EMPRESA DE TRANSFORMACION AGRARIA S.A.</h3><div class="meta">cliente_desaparece · venta actual 0 · venta comparativa 58,55</div><div class="tool">Accion: revisar historial de compra del periodo comparativo.</div></div><div class="amount">-100%<span>venta</span></div></div>
+      </div>
+      <div class="quick-links">
+        <a class="link-btn" href="#ventas">Ver ventas</a>
+        <a class="link-btn" href="#pendientes">Ver documentos pendientes</a>
+      </div>
+    </section>
+
+    <section class="section panel" id="stock">
+      <div class="section-head">
+        <div>
+          <h2>Stock · acciones recomendadas</h2>
+          <p>Origen MCP: <strong>stock_acciones_recomendadas</strong>. Prioriza valor inmovilizado sin ventas del periodo.</p>
+        </div>
+        <a class="link-btn" href="#resumen">Subir</a>
+      </div>
+      <div class="actions">
+        <div class="action-card"><div class="score">100</div><div><h3>SEMIMASCARA HM501B M</h3><div class="meta">HHM501BM · 1.042 unidades · stock_sin_ventas</div><div class="tool">Accion: liquidacion, promocion o devolucion si procede.</div></div><div class="amount">7.294,00<span>valor stock</span></div></div>
+        <div class="action-card"><div class="score">100</div><div><h3>GAFA AVATAR RX ROJA CLEAR HC</h3><div class="meta">H1036511 · 606 unidades · stock_sin_ventas</div><div class="tool">Accion: revisar salida comercial o reposicion.</div></div><div class="amount">7.246,12<span>valor stock</span></div></div>
+        <div class="action-card"><div class="score">100</div><div><h3>LITRO GASOLEO A</h3><div class="meta">000006000 · 3.820,36 unidades · baja_rotacion</div><div class="tool">Accion: revisar stock operativo frente a consumo real.</div></div><div class="amount">5.646,49<span>valor stock</span></div></div>
+      </div>
+      <div class="quick-links">
+        <a class="link-btn" href="#ventas">Ver margen ventas</a>
+        <a class="link-btn" href="#pendientes">Ver pedidos pendientes</a>
+      </div>
+    </section>
+
+    <section class="section panel" id="pendientes">
+      <div class="section-head">
+        <div>
+          <h2>Pendientes · acciones recomendadas</h2>
+          <p>Origen MCP: <strong>pedidos_acciones_recomendadas</strong>. Agrupa pedidos, presupuestos y documentos pendientes.</p>
+        </div>
+        <a class="link-btn" href="#resumen">Subir</a>
+      </div>
+      <div class="actions">
+        <div class="action-card"><div class="score">100</div><div><h3>Pedidos pendientes</h3><div class="meta">60 documentos · pendiente 39.704,28 · cobrado 0</div><div class="tool">Accion: priorizar pedidos de mayor importe.</div></div><div class="amount">39.704,28<span>pendiente</span></div></div>
+        <div class="action-card"><div class="score">100</div><div><h3>Presupuestos pendientes</h3><div class="meta">45 documentos · pendiente 28.215,06 · cobrado 0</div><div class="tool">Accion: reclamar aprobacion o cerrar oportunidad.</div></div><div class="amount">28.215,06<span>pendiente</span></div></div>
+        <div class="action-card"><div class="score">100</div><div><h3>Albaranes pendientes</h3><div class="meta">397 documentos · pendiente 62.556,40</div><div class="tool">Accion: decidir facturacion/cobro.</div></div><div class="amount">62.556,40<span>pendiente</span></div></div>
+      </div>
+      <div class="quick-links">
+        <a class="link-btn" href="#clientes">Ver clientes afectados</a>
+        <a class="link-btn" href="#tesoreria">Ver caja/cobros</a>
+      </div>
+    </section>
+
+    <section class="section panel" id="tesoreria">
+      <div class="section-head">
+        <div>
+          <h2>Tesoreria · acciones recomendadas</h2>
+          <p>Origen MCP: <strong>tesoreria_acciones_recomendadas</strong>. Revisa operaciones de caja sin efecto asociado.</p>
+        </div>
+        <a class="link-btn" href="#resumen">Subir</a>
+      </div>
+      <div class="actions">
+        <div class="action-card"><div class="score low">48</div><div><h3>Caja 1 · linea 2155</h3><div class="meta">Entrada · factura FC/339 · cliente 1574 · forma pago F</div><div class="tool">Accion: revisar si apunta a factura directa u operacion manual.</div></div><div class="amount">436,81<span>importe</span></div></div>
+        <div class="action-card"><div class="score low">43</div><div><h3>Caja 1 · linea 2389</h3><div class="meta">Salida · sin documento asociado · forma pago E</div><div class="tool">Accion: validar salida de caja sin efecto.</div></div><div class="amount">281,66<span>importe</span></div></div>
+        <div class="action-card"><div class="score low">42</div><div><h3>Caja 1 · linea 2334</h3><div class="meta">Entrada · factura FC/346 · cliente 891 · forma pago T</div><div class="tool">Accion: revisar efecto 0 y enlace documental.</div></div><div class="amount">252,58<span>importe</span></div></div>
+      </div>
+      <div class="quick-links">
+        <a class="link-btn" href="#pendientes">Ver pendientes</a>
+        <a class="link-btn" href="#clientes">Ver clientes</a>
+      </div>
+    </section>
+
+    <section class="section split">
+      <article class="panel">
+        <h2>Warnings devueltos por MCP</h2>
+        <p class="note">Hay articulos con lineas negativas que quedan compensados al agrupar todas sus ventas del periodo.</p>
+        <p class="note">La valoracion de stock usa ART_PRECOS; no revaloriza a coste historico por lote.</p>
+      </article>
+      <article class="panel">
+        <h2>Como encajaria en la app</h2>
+        <p class="note">Cada tarjeta de area llamaria a su funcion MCP: ventas, clientes, stock, pendientes o tesoreria. La bandeja ejecutiva usaria dashboard_acciones_recomendadas para ordenar por prioridad, y cada modulo mantendria sus filtros propios.</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

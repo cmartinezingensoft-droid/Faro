@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "faro": {
+      "command": "C:\\IA\\Faro\\MCP\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\IA\\Faro\\MCP\\server.py"],
+      "env": {
+        "FARO_DB_DRIVER": "odbc",
+        "FARO_ODBC_DSN": "Faro",
+        "FARO_MCP_TOOL_PROFILE": "core",
+        "FARO_MCP_ACCESS_LEVEL": "critical"
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Cache y bytecode Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Resultados generados por pruebas/herramientas
+test-runs/
+C_/
+CFaroERP/
+*.jsonl
+
+# Distribuciones locales
+dist/
+build/
+*.egg-info/
+
+# Sistema/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
