@@ -4,7 +4,7 @@
 >
 > Para el **catalogo de herramientas vigente hoy** (nombres publicos, perfiles, parametros) consulta `README.md` y, para el detalle completo de esquemas, `faro_mcp.tool_definitions()` o la pagina de ayuda en vivo del Probador MCP (`/ayuda`). Este historial documenta el *porque* se llego a ese contrato paso a paso; no lo sustituyas ni lo mantengas sincronizado con cada cambio menor: para eso esta el README.
 >
-> **Estado vigente (22/09/2026):** servidor **2.15.7**, contrato publico **2.0**, perfiles `core=81`, `admin=89`, `integrations=82`, `all/full=90` y suite **341/341 pruebas** correctas. Las cifras distintas que aparecen dentro de las fases siguientes son historicas y describen el estado exacto de cada fase en su momento.
+> **Estado vigente (24/09/2026):** servidor **2.15.8**, contrato publico **2.0**, perfiles `core=87`, `admin=96`, `integrations=88`, `all/full=97` y suite **356/356 pruebas** correctas, mas **371 subtests parametrizados**. Las cifras distintas que aparecen dentro de las fases siguientes son historicas y describen el estado exacto de cada fase en su momento.
 
 ## Indice
 
@@ -3327,3 +3327,67 @@ La version del servidor queda en **2.15.7**; el contrato publico sigue en
 `8df4f3bcf5770a69e66eb8ca8b81d69ded22f235d1c65e664fb1fe3e52234752`.
 
 Resultado de regresion tras la Fase 13: **341/341 pruebas** correctas.
+
+## Fase 14 - Analisis comercial de agentes y visitas frente a ventas (24/09/2026)
+
+Se amplio el MCP Faro con herramientas de lectura para estudiar el rendimiento
+de cada representante comercial, poniendo el foco en ventas, actividades,
+clientes, productos y rentabilidad. El analisis se apoya en las diferencias
+detectadas en las fuentes Delphi de Faro: los agentes viven en `REPRESE`, las
+actividades comerciales en `ACTIVI`, los tipos de actividad en `TIPACT`, los
+clientes en `CLIEN` y las ventas del agente se enlazan desde
+`CABDOCV.CBV_CODREP`, con rentabilidad calculada sobre las lineas `DETMOV`.
+
+Primero se publicaron cuatro herramientas base:
+
+- `comercial_agente_actividades`: resumen de actividades por representante y
+  periodo, con agrupacion por tipo de actividad, cliente y ultimos contactos.
+- `comercial_agente_clientes`: ranking de clientes vendidos por el agente,
+  enriquecido con venta neta, coste, margen, rentabilidad y actividades.
+- `comercial_agente_productos`: ranking de articulos vendidos por el agente,
+  con unidades, venta neta, coste, margen y rentabilidad.
+- `comercial_agente_analisis`: vision 360 del representante, combinando
+  totales de venta, rentabilidad, actividades, clientes top y productos top.
+
+Despues se añadieron dos herramientas especificas para responder a la pregunta
+comercial de como influyen las visitas en la venta:
+
+- `comercial_agente_visitas_ventas_clientes`: cruza por cliente las ventas y
+  las actividades del agente en el mismo periodo. Devuelve visitas,
+  actividades, ultima visita, dias desde la ultima visita, venta neta, coste,
+  margen, rentabilidad, venta por visita, margen por visita y una
+  clasificacion automatica.
+- `comercial_agente_visitas_ventas_oportunidades`: clasifica los clientes en
+  bloques accionables: `sobrevisitados`, `alto_valor_poco_visitado`,
+  `sin_visitas_con_venta`, `visitados_sin_venta` y `equilibrados`.
+
+La primera validacion real contra el DSN `Faro` mostro que algunos registros de
+`ACTIVI` no usan descripciones que contengan literalmente `VISIT`. Por eso, en
+Faro, la comparativa usa por defecto las actividades comerciales como
+contactos/visitas. El parametro `solo_visitas=true` conserva la opcion estricta
+de contar solo tipos cuyo texto contenga `VISIT`; `tipos_actividad` permite
+forzar codigos concretos de `TIPACT`. Los parametros `visitas_alta_desde` y
+`visitas_baja_hasta` permiten adaptar la clasificacion a la cadencia comercial
+real de la empresa.
+
+Validacion sobre datos reales:
+
+- Agente `5003`: 70 clientes con venta y sin visitas registradas en el periodo,
+  clasificados como `sin_visitas_con_venta`.
+- Agente `2007`: 234 actividades, 58 clientes con ventas, 61 clientes
+  visitados, 50 clientes visitados con venta, 11 visitados sin venta, 8 con
+  venta sin visita, 16 sobrevisitados, 1 de alto valor poco visitado y 35
+  equilibrados.
+
+Se actualizo tambien el registro global de Codex para publicar `faro-mcp` en
+modo `critical`, con `FARO_ODBC_DSN=Faro`, `FARO_MCP_TOOL_PROFILE=all` y
+`FARO_MCP_ACCESS_LEVEL=critical`, replicando el criterio de configuracion usado
+en `kronos-mcp`.
+
+La version del servidor queda en **2.15.8**; el contrato publico sigue en
+**2.0**. Los perfiles quedan en `core=87`, `admin=96`, `integrations=88`,
+`all/full=97`. El snapshot SHA-256 del catalogo `all` queda en
+`b258f79f7b0a835463cb9611e889eef3135aea0663d714a17ec20330ea36409d`.
+
+Resultado de regresion tras la Fase 14: **356/356 pruebas** correctas, mas
+**371 subtests parametrizados**.

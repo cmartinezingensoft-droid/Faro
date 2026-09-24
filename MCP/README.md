@@ -22,7 +22,7 @@ $env:FARO_DB_PASSWORD = "masterkey"
 $env:FARO_EMPRESA = "1"
 $env:FARO_CENTRO = "0"
 $env:FARO_USUARIO = "codex"
-$env:FARO_MCP_TOOL_PROFILE = "core"  # core (81), admin (89), integrations (82) o all (90)
+$env:FARO_MCP_TOOL_PROFILE = "core"  # core (87), admin (96), integrations (88) o all (97)
 $env:FARO_MCP_ACCESS_LEVEL = "critical" # critical por defecto; read y write siguen disponibles
 ```
 
@@ -163,21 +163,21 @@ cd C:\IA\Faro\MCP
 .\.venv\Scripts\python.exe -m pytest tests\ -q
 ```
 
-Estado actual: **341/341 pruebas** correctas.
+Estado actual: **356/356 pruebas** correctas, mas **371 subtests parametrizados**.
 
 ## Catalogo de herramientas
 
-Version del servidor: **2.15.7**. Contrato publico: **2.0**. Migracion DataSnap -> Python nativo: **100 %** (0 proxies DataSnap).
+Version del servidor: **2.15.8**. Contrato publico: **2.0**. Migracion DataSnap -> Python nativo: **100 %** (0 proxies DataSnap).
 
 Herramientas publicas por perfil (`FARO_MCP_TOOL_PROFILE`):
 
 | Perfil | Herramientas | Descripcion |
 | --- | --- | --- |
-| `core` (por defecto) | 81 | Operacion habitual. |
-| `admin` | 89 | `core` + mantenimientos/operaciones avanzadas. |
-| `integrations` | 82 | `core` + integracion Coinfer. |
-| `all` | 90 | Union completa. |
-| `full` | 90 | Alias de compatibilidad de `all`. |
+| `core` (por defecto) | 87 | Operacion habitual. |
+| `admin` | 96 | `core` + mantenimientos/operaciones avanzadas. |
+| `integrations` | 88 | `core` + integracion Coinfer. |
+| `all` | 97 | Union completa. |
+| `full` | 97 | Alias de compatibilidad de `all`. |
 
 Cada herramienta tiene ademas un **nivel de riesgo** (`lectura`, `escritura` o `critica`) independiente del perfil, controlado por `FARO_MCP_ACCESS_LEVEL` (ver [Seguridad y auditoria](#seguridad-y-auditoria)). El borde del contrato v2 valida estrictamente los tipos JSON Schema usados por el catalogo, incluidos tipos alternativos como `number|string`, limites `minItems`/`maxItems`, `enum`, campos obligatorios y `additionalProperties=false`. El listado completo, siempre actualizado, esta disponible en vivo en `/ayuda` desde el Probador MCP o programaticamente via `faro_mcp.tool_definitions()`. Resumen por dominio (perfil `all`):
 
@@ -235,6 +235,19 @@ Con `actualizar_precio_venta=false` (por defecto) solo se modifica `ARTICULP`. C
 - `cliente_buscar` [lectura] (core)
 - `cliente_tipo_venta` [lectura] (admin)
 - `cliente_ultimas_ventas` [lectura] (core)
+
+### COMERCIAL / AGENTES
+
+Herramientas de solo lectura orientadas a analizar el rendimiento de representantes comerciales. Cruzan ventas de `CABDOCV`/`DETMOV`, rentabilidad por linea, actividades de `ACTIVI`, tipos de actividad de `TIPACT`, clientes de `CLIEN` y agentes de `REPRESE`.
+
+- `comercial_agente_actividades` [lectura] (core) — resume actividades de un representante por periodo, agrupadas por tipo y cliente, con ultimas actividades.
+- `comercial_agente_analisis` [lectura] (core) — vision 360 de un agente: ventas, margen, rentabilidad, actividades, clientes top y productos top.
+- `comercial_agente_clientes` [lectura] (core) — ranking de clientes vendidos por agente con venta neta, coste, margen, rentabilidad y actividades asociadas.
+- `comercial_agente_productos` [lectura] (core) — ranking de productos vendidos por agente con unidades, venta neta, coste, margen y rentabilidad.
+- `comercial_agente_visitas_ventas_clientes` [lectura] (core) — cruza clientes vendidos y clientes visitados para calcular venta por visita, margen por visita, ultima visita, dias desde la ultima visita y clasificacion comercial.
+- `comercial_agente_visitas_ventas_oportunidades` [lectura] (core) — clasifica oportunidades y riesgos comerciales: clientes sobrevisitados, alto valor poco visitado, venta sin visita, visitas sin venta y clientes equilibrados.
+
+La comparativa visitas/ventas usa por defecto las actividades comerciales del periodo como contacto/visita. Si se quiere restringir solo a tipos cuyo texto contenga `VISIT`, puede usarse `solo_visitas=true`; tambien se pueden filtrar codigos concretos con `tipos_actividad`. Los umbrales `visitas_alta_desde` y `visitas_baja_hasta` permiten adaptar la clasificacion a la cadencia comercial de la empresa.
 
 ### CARTERA
 
