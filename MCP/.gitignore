@@ -14,6 +14,7 @@ htmlcov/
 
 # Resultados generados por pruebas/herramientas
 test-runs/
+_render_*/
 C_/
 CFaroERP/
 *.jsonl
