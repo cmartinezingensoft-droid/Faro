@@ -12,8 +12,9 @@ from tests._runtime_compat import legacy_handle_for_test
 class CleanupPhase13SecurityAuditTests(unittest.TestCase):
     def _server(self, tmp, access="read", **extra):
         env = {
+            "FARO_MAIN_DIR": str(tmp),
             "FARO_MCP_ACCESS_LEVEL": access,
-            "FARO_MCP_AUDIT_LOG": str(Path(tmp) / "audit.jsonl"),
+            "FARO_MCP_AUDIT_LOG": "audit.jsonl",
             "FARO_MCP_ACTOR": "tester",
             "FARO_MCP_CLIENT_ID": "unit-tests",
             "FARO_MCP_AUDIT_REQUIRED": "true",
@@ -22,7 +23,7 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
         patcher = patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        return faro_mcp.FaroToolRuntime(), Path(env["FARO_MCP_AUDIT_LOG"])
+        return faro_mcp.FaroToolRuntime(), Path(tmp) / env["FARO_MCP_AUDIT_LOG"]
 
     @staticmethod
     def _payload(response):
@@ -35,9 +36,9 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
             | faro_mcp.CRITICAL_TOOL_NAMES
         )
         self.assertEqual(union, faro_mcp.ALL_PUBLIC_TOOL_NAMES)
-        self.assertEqual(len(faro_mcp.READ_ONLY_TOOL_NAMES), 67)
+        self.assertEqual(len(faro_mcp.READ_ONLY_TOOL_NAMES), 69)
         self.assertEqual(len(faro_mcp.WRITE_TOOL_NAMES), 16)
-        self.assertEqual(len(faro_mcp.CRITICAL_TOOL_NAMES), 14)
+        self.assertEqual(len(faro_mcp.CRITICAL_TOOL_NAMES), 17)
         self.assertFalse(faro_mcp.READ_ONLY_TOOL_NAMES & faro_mcp.WRITE_TOOL_NAMES)
         self.assertFalse(faro_mcp.READ_ONLY_TOOL_NAMES & faro_mcp.CRITICAL_TOOL_NAMES)
         self.assertFalse(faro_mcp.WRITE_TOOL_NAMES & faro_mcp.CRITICAL_TOOL_NAMES)
@@ -150,8 +151,8 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             blocker = Path(tmp) / "not-a-directory"
             blocker.write_text("x", encoding="utf-8")
-            bad_path = blocker / "audit.jsonl"
-            server, _ = self._server(tmp, "write", FARO_MCP_AUDIT_LOG=str(bad_path))
+            bad_path = "not-a-directory/audit.jsonl"
+            server, _ = self._server(tmp, "write", FARO_MCP_AUDIT_LOG=bad_path)
             server.tools["control_horario_fichar"] = Mock(return_value={"tipo": "I"})
             response = legacy_handle_for_test(server, {
                 "jsonrpc": "2.0", "id": 6, "method": "tools/call",
@@ -209,7 +210,7 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
         ).encode("utf-8")
         self.assertEqual(
             hashlib.sha256(payload).hexdigest(),
-            "b258f79f7b0a835463cb9611e889eef3135aea0663d714a17ec20330ea36409d",
+            "69714b385eeab9a0a400cec80c60867e2dad9678cb10b982cb97ec3adabecdc6",
         )
 
     def test_server_version(self):

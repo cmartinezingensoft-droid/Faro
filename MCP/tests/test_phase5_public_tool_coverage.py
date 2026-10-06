@@ -241,7 +241,8 @@ class Phase5PublicToolCoverageTests(unittest.TestCase):
                     "FARO_MCP_TOOL_PROFILE": "all",
                     "FARO_MCP_ACCESS_LEVEL": "critical",
                     "FARO_MCP_AUDIT_REQUIRED": "true",
-                    "FARO_MCP_AUDIT_LOG": os.path.join(tmp, "audit.jsonl"),
+                    "FARO_MAIN_DIR": tmp,
+                    "FARO_MCP_AUDIT_LOG": "audit.jsonl",
                 },
                 clear=False,
             ):

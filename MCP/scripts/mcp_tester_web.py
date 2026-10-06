@@ -53,7 +53,7 @@ import faro_mcp  # noqa: E402
 # pagina, para que sigan aplicados la proxima vez que se arranque el
 # probador (con un .bat o a mano) sin tener que volver a escribirlos.
 SETTINGS_PATH = ROOT / "mcp_tester_settings.json"
-PERSISTABLE_ENV_VARS = {"FARO_EMPRESA", "FARO_CENTRO", "FARO_USUARIO"}
+PERSISTABLE_ENV_VARS = {"FARO_EMPRESA", "FARO_CENTRO", "FARO_USUARIO", "FARO_MAIN_DIR"}
 
 
 def load_persisted_settings() -> dict:

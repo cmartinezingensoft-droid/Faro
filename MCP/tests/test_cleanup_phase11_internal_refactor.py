@@ -8,7 +8,7 @@ import faro_mcp
 from tests._runtime_compat import legacy_handle_for_test
 
 
-PHASE12_ALL_SCHEMA_SHA256 = "b258f79f7b0a835463cb9611e889eef3135aea0663d714a17ec20330ea36409d"
+PHASE12_ALL_SCHEMA_SHA256 = "69714b385eeab9a0a400cec80c60867e2dad9678cb10b982cb97ec3adabecdc6"
 # Hash actualizado de forma intencional:
 # 1) al permitir que stock_trasvasar reciba lineas con solo articulo+cantidad
 #    (descripcion/unidad_medida se autocompletan desde ARTICUL si se dejan
@@ -92,6 +92,20 @@ PHASE12_ALL_SCHEMA_SHA256 = "b258f79f7b0a835463cb9611e889eef3135aea0663d714a17ec
 # 28) al anadir centro como parametro opcional comun a las herramientas de
 #    stock, ventas, compras y almacen, con default 0; la cadena vacia queda
 #    reservada para consultar todos los centros.
+# 29) al anadir entrada_almacen_pdf_previsualizar y entrada_almacen_desde_pdf
+#    para alta de entradas desde PDF con gestion documental.
+# 30) al anadir entrada_almacen_pendientes_integrar para procesar PDFs de
+#    GestionDC\Pendientes en lote, evitando duplicados y copiando a
+#    GestionDC\Procesados y Documentos\Entradas tras crear la entrada.
+# 31) al documentar que entrada_almacen_pendientes_integrar genera log de
+#    texto en GestionDC\Logs con acciones realizadas y errores.
+# 32) al anadir entrada_almacen_imagen_previsualizar y
+#    entrada_almacen_desde_imagen, y ampliar pendientes para aceptar imagenes
+#    mediante OCR o texto_extraido.
+# 33) al parametrizar entrada desde documento con
+#    politica_articulo_no_encontrado y politica_precio_compra.
+# 34) al anadir solo_gestion_documental en la integracion de pendientes
+#    para archivar facturas/albaranes sin crear entrada ni tocar stock.
 # Si vuelve a fallar, confirma primero que el cambio de esquema es
 # intencional antes de tocar este valor.
 
@@ -100,7 +114,7 @@ class CleanupPhase11InternalRefactorTests(unittest.TestCase):
     def test_public_handlers_use_canonical_method_names(self):
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "all"}):
             server = faro_mcp.FaroToolRuntime()
-        self.assertEqual(len(server.tools), 97)
+        self.assertEqual(len(server.tools), 102)
         for name, handler in server.tools.items():
             with self.subTest(name=name):
                 self.assertEqual(handler.__name__, f"tool_{name}")
@@ -121,7 +135,7 @@ class CleanupPhase11InternalRefactorTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(payload).hexdigest(), PHASE12_ALL_SCHEMA_SHA256)
 
     def test_profiles_keep_frozen_counts(self):
-        expected = {"core": 87, "admin": 96, "integrations": 88, "all": 97, "full": 97}
+        expected = {"core": 92, "admin": 101, "integrations": 93, "all": 102, "full": 102}
         for profile, count in expected.items():
             with self.subTest(profile=profile), patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": profile}):
                 server = faro_mcp.FaroToolRuntime()

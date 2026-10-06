@@ -290,6 +290,8 @@ Estas funciones son distintas de `negocio_clientes_riesgo`: `negocio_clientes_ri
 ### ENTRADA
 
 - `entrada_almacen_crear` [critica] (core) — crea una entrada de almacen desde cabecera y lineas estructuradas, con actualizacion de existencias.
+- `entrada_almacen_pdf_previsualizar` [lectura] (core) — extrae texto de un PDF de proveedor y propone cabecera/lineas para revisar antes del alta.
+- `entrada_almacen_desde_pdf` [critica] (core) — crea la entrada desde un PDF y ajustes manuales, reutilizando `entrada_almacen_crear`; despues registra el PDF en `DOCUMENTO` y lo copia a `GestionDC\Compras\...`.
 - `entrada_pedidos_relacionados` [lectura] (admin)
 
 ### ETIQUETA / RECUENTO / FALTA
@@ -383,7 +385,8 @@ Configuracion recomendada:
 $env:FARO_MCP_ACCESS_LEVEL = "critical"  # valor por defecto; read | write | critical
 $env:FARO_MCP_ACTOR = "chatgpt-produccion"
 $env:FARO_MCP_CLIENT_ID = "erp-mcp"
-$env:FARO_MCP_AUDIT_LOG = "C:\FaroERP\logs\faro_mcp_audit.jsonl"
+$env:FARO_MAIN_DIR = "C:\Proyectos\Faro"
+$env:FARO_MCP_AUDIT_LOG = "logs\faro_mcp_audit.jsonl"
 $env:FARO_MCP_AUDIT_REQUIRED = "true"
 $env:FARO_MCP_AUDIT_READS = "false"
 ```

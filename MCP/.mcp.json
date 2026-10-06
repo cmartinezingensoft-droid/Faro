@@ -6,6 +6,10 @@
       "env": {
         "FARO_DB_DRIVER": "odbc",
         "FARO_ODBC_DSN": "Faro",
+        "FARO_MAIN_DIR": "C:\\Proyectos\\Faro",
+        "FARO_DOCUMENTS_DIR": "Documentos",
+        "FARO_IMAGES_DIR": "Datos\\Fotos",
+        "FARO_PEDIDOS_PDF_DIR": "Documentos\\Ventas\\Pedidos",
         "FARO_MCP_TOOL_PROFILE": "core",
         "FARO_MCP_ACCESS_LEVEL": "critical"
       }

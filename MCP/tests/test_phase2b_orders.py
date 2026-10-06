@@ -99,15 +99,53 @@ class FakeDbCloseOrder:
         self.executed = []
         self.commits = 0
         self.rollbacks = 0
+        self.lines = [self._line(10), self._line(20)]
+
+    def _header(self, tipdoc):
+        return {
+            "CBV_NUMEMP": 1,
+            "CBV_CENTRO": 0,
+            "CBV_TIPDOC": tipdoc,
+            "CBV_TIPAC": "0",
+            "CBV_EJERCI": 2026,
+            "CBV_SERIE": "PM",
+            "CBV_NUMDOC": 12,
+            "CBV_BASIMP1": 100,
+            "CBV_BASIMP2": 0,
+            "CBV_BASIMP3": 0,
+            "CBV_BASIMP4": 0,
+            "CBV_TOTALS": 100,
+            "CBV_TOTALD": 121,
+        }
+
+    def _line(self, numlin):
+        return {
+            "DMV_NUMEMP": 1, "DMV_CENTRO": 0, "DMV_TIPDOC": self.existing_tipdoc, "DMV_TIPAC": "0",
+            "DMV_EJERCI": 2026, "DMV_SERIE": "PM", "DMV_NUMDOC": 12, "DMV_NUMLIN": numlin,
+            "DMV_SIGNO": "0", "DMV_CAJA": "", "DMV_USUAR": "test", "DMV_TIPLIN": "D",
+            "DMV_FECMOV": "2026-01-01", "DMV_CODART": f"ART{numlin}", "DMV_DESCRI": "Linea",
+            "DMV_CODMON": "E", "DMV_TIPPRE": "", "DMV_PREVEN": 1, "DMV_PORIVA": 21,
+            "DMV_PORREQ": 0, "DMV_PVP": 1, "DMV_CANTID": 1, "DMV_CANPRE": 0, "DMV_UNIMED": "",
+            "DMV_DTO1": 0, "DMV_DTO2": 0, "DMV_VALLIN": 50, "DMV_VALLINS": 50, "DMV_IMPDTO": 0,
+            "DMV_EJEOFE": 0, "DMV_NUMOFE": 0, "DMV_EJERCIO": 0, "DMV_TIPDOCO": "",
+            "DMV_SERIEO": "", "DMV_NUMDOCO": 0, "DMV_NUMLINO": 0, "DMV_PREIVA": "",
+        }
 
     def fetch_one(self, sql, params=()):
         u = " ".join(sql.upper().split())
+        if "MAX(DMV_NUMLIN)" in u:
+            return {"N": 20}
         if "CBV_TIPDOC='S'" in u:
-            return {"CBV_NUMDOC": params[-1]} if self.collision else None
+            return self._header("S") if self.collision else None
         if "FROM CABDOCV" in u:
             tipdoc = params[2]
-            return {"CBV_NUMDOC": params[-1]} if tipdoc == self.existing_tipdoc else None
+            return self._header(tipdoc) if tipdoc == self.existing_tipdoc else None
         return None
+
+    def fetch_all(self, sql, params=()):
+        if "FROM DETMOV" in sql.upper():
+            return self.lines
+        return []
 
     def execute(self, sql, params=()):
         if self.fail_execute:
@@ -222,6 +260,24 @@ class Phase2BOrderTests(unittest.TestCase):
         self.assertEqual(result["tipo_origen"], "R")
         self.assertEqual(db.executed[0][1][5], "R")
         self.assertEqual(db.executed[1][1], (1, 0, "R", "0", 2026, "PM", 12))
+
+    def test_cerrar_pedido_merges_lines_when_historic_header_exists(self):
+        db = FakeDbCloseOrder(existing_tipdoc="P", collision=True)
+        svc = faro_mcp.FaroPhase1Service(db)
+        result = svc.close_client_order("carlos", 0, "P", 2026, "PM", 12)
+
+        self.assertEqual(db.commits, 1)
+        self.assertEqual(db.rollbacks, 0)
+        self.assertTrue(result["fusionado"])
+        self.assertEqual(result["lineas_fusionadas"], 2)
+        inserts = [item for item in db.executed if item[0].startswith("INSERT INTO DETMOV")]
+        self.assertEqual(len(inserts), 2)
+        self.assertEqual(inserts[0][1][2], "S")
+        self.assertEqual(inserts[0][1][7], 21)
+        self.assertEqual(inserts[1][1][7], 22)
+        self.assertTrue(any("UPDATE CABDOCV SET CBV_BASIMP1=COALESCE" in item[0] for item in db.executed))
+        self.assertTrue(any(item[0].startswith("DELETE FROM DETMOV") for item in db.executed))
+        self.assertTrue(any(item[0].startswith("DELETE FROM CABDOCV") for item in db.executed))
 
     def test_cerrar_pedido_rejects_other_document_types(self):
         db = FakeDbCloseOrder(existing_tipdoc="A")

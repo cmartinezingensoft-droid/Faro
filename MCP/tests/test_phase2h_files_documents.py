@@ -12,7 +12,7 @@ class DocumentsDb:
         self.settings = faro_mcp.Settings(
             db_driver="odbc", db_path="", odbc_dsn="faro", db_user="u", db_password="p",
             empresa=1, centro=7, usuario="test", main_dir=root,
-            documents_dir=str(Path(root) / "Documentos"), images_dir=str(Path(root) / "Imagenes"),
+            documents_dir="Documentos", images_dir="Datos\\Fotos",
             smtp_host="smtp.example.test", smtp_port=25, smtp_user="user", smtp_password="secret",
             smtp_from="erp@example.test", smtp_from_name="Faro ERP",
         )
@@ -111,10 +111,10 @@ class Phase2HFilesDocumentsTests(unittest.TestCase):
         }
         self.assertTrue(public.issubset(server.tools))
         self.assertTrue(internal.isdisjoint(server.tools))
-        self.assertEqual(len(server.tools), 87)
+        self.assertEqual(len(server.tools), 92)
         self.assertFalse(any(name.startswith("datasnap_") for name in server.tools))
         defs = {x["name"] for x in faro_mcp.tool_definitions()}
-        self.assertEqual(len(defs), 87)
+        self.assertEqual(len(defs), 92)
         self.assertTrue(public.issubset(defs))
         self.assertTrue(internal.isdisjoint(defs))
 
@@ -138,7 +138,7 @@ class Phase2HFilesDocumentsTests(unittest.TestCase):
     def test_article_image_original_and_resized(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = DocumentsDb(tmp)
-            root = Path(db.settings.images_dir)
+            root = Path(tmp) / db.settings.images_dir
             (root / "articulos").mkdir(parents=True)
             (root / "resized").mkdir(parents=True)
             (root / "articulos" / "A1.jpg").write_bytes(b"ORIGINAL")
