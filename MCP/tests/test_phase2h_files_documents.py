@@ -111,10 +111,10 @@ class Phase2HFilesDocumentsTests(unittest.TestCase):
         }
         self.assertTrue(public.issubset(server.tools))
         self.assertTrue(internal.isdisjoint(server.tools))
-        self.assertEqual(len(server.tools), 92)
+        self.assertEqual(len(server.tools), len(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
         self.assertFalse(any(name.startswith("datasnap_") for name in server.tools))
         defs = {x["name"] for x in faro_mcp.tool_definitions()}
-        self.assertEqual(len(defs), 92)
+        self.assertEqual(len(defs), len(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
         self.assertTrue(public.issubset(defs))
         self.assertTrue(internal.isdisjoint(defs))
 

@@ -29,11 +29,14 @@ def main(argv: list[str]) -> int:
     price_policy = argv[2] if len(argv) > 2 and argv[2] else "mantener"
     limit = parse_int(argv[3] if len(argv) > 3 else "")
     document_only = parse_bool(argv[4] if len(argv) > 4 else "")
+    selected_names = json.loads(argv[5]) if len(argv) > 5 and argv[5] else []
 
     args: dict[str, object] = {
         "politica_articulo_no_encontrado": missing_policy,
         "politica_precio_compra": price_policy,
         "solo_gestion_documental": document_only,
+        "selected_names": selected_names,
+        "persistir_propuesta": True,
     }
     if limit is not None:
         args["limite"] = limit

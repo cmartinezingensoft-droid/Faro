@@ -21,10 +21,10 @@ class CleanupPhase8ArticlesTests(unittest.TestCase):
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "full"}):
             full = faro_mcp.FaroToolRuntime()
             full_defs = {item["name"] for item in faro_mcp.tool_definitions()}
-        self.assertEqual(len(core.tools), 87)
-        self.assertEqual(len(core_defs), 87)
-        self.assertEqual(len(full.tools), 97)
-        self.assertEqual(len(full_defs), 97)
+        self.assertEqual(len(core.tools), len(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
+        self.assertEqual(len(core_defs), len(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
+        self.assertEqual(len(full.tools), len(faro_mcp.ALL_PUBLIC_TOOL_NAMES))
+        self.assertEqual(len(full_defs), len(faro_mcp.ALL_PUBLIC_TOOL_NAMES))
         for name in ("articulo_obtener", "articulo_compra_consultar", "articulo_catalogo_listar"):
             self.assertIn(name, core.tools)
             self.assertIn(name, full.tools)

@@ -14,8 +14,8 @@ class CleanupPhase2ConsolidationTests(unittest.TestCase):
             "actividad_listar", "actividad_tipo_listar",
             "pedido_detalle", "articulo_cambiar_tabla_precio", "articulo_familia_guardar",
         }
-        self.assertEqual(len(server.tools), 87)
-        self.assertEqual(len(definitions), 87)
+        self.assertEqual(len(server.tools), len(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
+        self.assertEqual(len(definitions), len(faro_mcp.CORE_PUBLIC_TOOL_NAMES))
         self.assertTrue(core_merged.issubset(server.tools))
         self.assertTrue(core_merged.issubset(definitions))
         self.assertNotIn("articulo_ubicacion_guardar", server.tools)

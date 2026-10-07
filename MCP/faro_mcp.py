@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import calendar
 import contextvars
+import hashlib
 import json
 import mimetypes
 import os
@@ -23,7 +24,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Any, Callable
 
 
@@ -126,7 +127,22 @@ def _is_duplicate_key_error(exc: Exception) -> bool:
 def dec(value: Any, default: str = "0") -> Decimal:
     if value is None:
         return Decimal(default)
-    return Decimal(str(value))
+    if isinstance(value, Decimal):
+        return value
+    text = str(value).strip()
+    if not text:
+        return Decimal(default)
+    text = re.sub(r"[^\d,.\-+]", "", text)
+    if not text or text in {"-", "+", ".", ",", "-.", "+."}:
+        return Decimal(default)
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+    return Decimal(text)
 
 
 def my_round(value: Decimal) -> int:
@@ -823,6 +839,35 @@ class FaroArticleService:
                 tuple(values),
             )
             self.db.commit()
+            cleanup_source = str(
+                source_args.get("ruta_pdf")
+                or source_args.get("ruta_imagen")
+                or row.get("GDI_ORIGEN")
+                or (proposal.get("pdf") or {}).get("origen")
+                or ""
+            ).strip()
+            if cleanup_source:
+                source_path = Path(cleanup_source).expanduser()
+                try:
+                    if source_path.exists() and source_path.parent.resolve() == self._gestion_documental_pending_dir().resolve():
+                        processed_args = {
+                            "nombre_fichero": source_path.name,
+                        }
+                        if source_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+                            processed_args["ruta_imagen"] = str(source_path)
+                        else:
+                            processed_args["ruta_pdf"] = str(source_path)
+                        result["procesados"] = self._copy_pdf_source_to(
+                            processed_args,
+                            self._gestion_documental_processed_dir(),
+                        )
+                        result["pendiente_borrado"] = self._delete_pending_document(source_path)
+                except Exception as cleanup_error:
+                    result["pendiente_borrado"] = {
+                        "ruta": str(source_path),
+                        "borrado": False,
+                        "error": str(cleanup_error),
+                    }
         except Exception:
             self.db.rollback()
             raise
@@ -6443,10 +6488,33 @@ class FaroPhase1Service:
         if not text:
             return Decimal("0")
         if "," in text and "." in text:
-            text = text.replace(".", "").replace(",", ".")
+            last_comma = text.rfind(",")
+            last_dot = text.rfind(".")
+            if last_comma > last_dot:
+                text = text.replace(".", "").replace(",", ".")
+            else:
+                text = text.replace(",", "")
         elif "," in text:
-            text = text.replace(",", ".")
+            parts = text.split(",")
+            if len(parts) > 1 and all(len(part) == 3 for part in parts[1:]) and len(parts[-1]) != 2:
+                text = "".join(parts)
+            else:
+                text = text.replace(",", ".")
+        elif "." in text:
+            parts = text.split(".")
+            if len(parts) > 1 and all(len(part) == 3 for part in parts[1:]) and len(parts[-1]) != 2:
+                text = "".join(parts)
         return Decimal(text)
+
+    @staticmethod
+    def _round_purchase_pdf_amount(value: Decimal) -> Decimal:
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    @classmethod
+    def _format_purchase_pdf_amount(cls, value: Decimal | None) -> str | None:
+        if value is None:
+            return None
+        return str(cls._round_purchase_pdf_amount(value))
 
     @staticmethod
     def _parse_pdf_date(value: str) -> str | None:
@@ -6460,11 +6528,31 @@ class FaroPhase1Service:
 
     @classmethod
     def _extract_purchase_pdf_date(cls, text: str) -> str | None:
-        numeric_match = re.search(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b", text)
-        if numeric_match:
-            parsed = cls._parse_pdf_date(numeric_match.group(1))
-            if parsed:
-                return parsed
+        source = str(text or "")
+        normalized_source = unicodedata.normalize("NFKD", source).encode("ascii", "ignore").decode("ascii")
+        date_pattern = r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})"
+        label_patterns = [
+            rf"\bFECHA\s+(?:DE\s+)?(?:FACTURA|EMISION|EXPEDICION)\b\s*:?\s*{date_pattern}",
+            rf"\b(?:FACTURA|EMISION|EXPEDICION)\s+FECHA\b\s*:?\s*{date_pattern}",
+            rf"\bF(?:ECHA)?\.?\s*FRA\.?\b\s*:?\s*{date_pattern}",
+        ]
+        for pattern in label_patterns:
+            match = re.search(pattern, normalized_source, re.IGNORECASE)
+            if match:
+                parsed = cls._parse_pdf_date(match.group(1))
+                if parsed:
+                    return parsed
+        for raw_line in normalized_source.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if not line:
+                continue
+            if re.search(r"\b(?:VENCIMIENTO|VENCE|PAGO|PERIODO|FACTURACION|DESDE|HASTA)\b", line, re.IGNORECASE):
+                continue
+            numeric_match = re.search(rf"\b{date_pattern}\b", line)
+            if numeric_match:
+                parsed = cls._parse_pdf_date(numeric_match.group(1))
+                if parsed:
+                    return parsed
         normalized = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
         month_names = {
             "enero": 1,
@@ -6497,6 +6585,78 @@ class FaroPhase1Service:
             return date(year, month, day).isoformat()
         except ValueError:
             return None
+
+    @classmethod
+    def _extract_purchase_pdf_totals(cls, text: str) -> dict[str, Decimal | None]:
+        source = str(text or "")
+        money = r"[-+]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|[-+]?\d+(?:[.,]\d{2})"
+        totals: dict[str, Decimal | None] = {"source_net": None, "source_tax": None, "source_gross": None}
+        base_patterns = [
+            rf"\bBASE\s+IMPONIBLE\b\s*:?\s*({money})",
+            rf"\bTOTAL\s+BASE\b\s*:?\s*({money})",
+        ]
+        tax_patterns = [
+            rf"\bIVA\b(?:\s+\d{{1,2}}(?:[.,]\d+)?)?\s*:?\s*({money})",
+            rf"\bTOTAL\s+IVA\b\s*:?\s*({money})",
+        ]
+        gross_patterns = [
+            rf"\bTOTAL\s+(?:FACTURA|DOCUMENTO|A\s+PAGAR|EUR|EUROS?)\b\s*:?\s*(?:EUR|EU)?\s*({money})",
+            rf"\bIMPORTE\s+FACTURA\b\s*:?\s*(?:EUR|EU)?\s*({money})",
+        ]
+        for key, patterns in (
+            ("source_net", base_patterns),
+            ("source_tax", tax_patterns),
+            ("source_gross", gross_patterns),
+        ):
+            for pattern in patterns:
+                matches = list(re.finditer(pattern, source, re.IGNORECASE))
+                if matches:
+                    totals[key] = cls._parse_pdf_number(matches[-1].group(1))
+                    break
+        return totals
+
+    @classmethod
+    def _purchase_pdf_line_net_amount(cls, line: dict[str, Any]) -> Decimal:
+        if line.get("importe_origen") not in (None, ""):
+            return cls._parse_pdf_number(str(line.get("importe_origen")))
+        amount = cls._parse_pdf_number(str(line.get("cantidad") or "0")) * cls._parse_pdf_number(str(line.get("precio") or "0"))
+        for index in range(1, 7):
+            discount = cls._parse_pdf_number(str(line.get(f"descuento{index}") or "0"))
+            if discount:
+                amount *= Decimal("1") - discount / Decimal("100")
+        return amount
+
+    @classmethod
+    def _purchase_pdf_reconciliation(cls, text: str, lines: list[dict[str, Any]]) -> dict[str, Any]:
+        source_totals = cls._extract_purchase_pdf_totals(text)
+        computed_net = sum((cls._purchase_pdf_line_net_amount(line) for line in lines), Decimal("0"))
+        computed_tax = sum(
+            (
+                cls._purchase_pdf_line_net_amount(line)
+                * cls._parse_pdf_number(str(line.get("iva") or "21"))
+                / Decimal("100")
+                for line in lines
+            ),
+            Decimal("0"),
+        )
+        computed_gross = computed_net + computed_tax
+        expected = source_totals.get("source_gross")
+        if expected is None and source_totals.get("source_net") is not None and source_totals.get("source_tax") is not None:
+            expected = dec(source_totals.get("source_net")) + dec(source_totals.get("source_tax"))
+        tolerance = Decimal("0.01")
+        difference = cls._round_purchase_pdf_amount(computed_gross - expected) if expected is not None else None
+        reconciled = True if expected is None else abs(difference or Decimal("0")) <= tolerance
+        return {
+            "source_net": cls._format_purchase_pdf_amount(source_totals.get("source_net")),
+            "source_tax": cls._format_purchase_pdf_amount(source_totals.get("source_tax")),
+            "source_gross": cls._format_purchase_pdf_amount(source_totals.get("source_gross") or expected),
+            "computed_net": cls._format_purchase_pdf_amount(computed_net),
+            "computed_tax": cls._format_purchase_pdf_amount(computed_tax),
+            "computed_gross": cls._format_purchase_pdf_amount(computed_gross),
+            "difference": cls._format_purchase_pdf_amount(difference) if difference is not None else None,
+            "tolerance": str(tolerance),
+            "reconciled": reconciled,
+        }
 
     @staticmethod
     def _purchase_entry_image_suffix(data: bytes, source: str = "") -> str:
@@ -6589,13 +6749,27 @@ class FaroPhase1Service:
         except Exception as exc:
             raise FaroError("No se pudo extraer texto de la imagen: " + str(exc)) from exc
 
-    def _extract_purchase_entry_pdf_ocr_text(self, data: bytes, source: str) -> str:
+    def _extract_purchase_entry_pdf_ocr_pages(
+        self, data: bytes, source: str, page_count: int | None = None
+    ) -> tuple[str, list[int], bool]:
+        max_pages = max(1, min(int(os.getenv("FARO_PDF_OCR_MAX_PAGES", "5") or "5"), 20))
+        if page_count is not None and page_count > max_pages:
+            limit_reached = True
+        else:
+            limit_reached = False
+        if "_extract_purchase_entry_pdf_ocr_text" in self.__dict__:
+            text = self.__dict__["_extract_purchase_entry_pdf_ocr_text"](data, source)
+            processed_count = min(page_count or max_pages, max_pages)
+            self._last_purchase_entry_ocr_page_texts = [
+                {"page": page, "text": text if page == 1 else ""}
+                for page in range(1, processed_count + 1)
+            ]
+            return text, list(range(1, processed_count + 1)), limit_reached
         pdftoppm = os.getenv("FARO_PDFTOPPM", "").strip() or shutil.which("pdftoppm")
         if not pdftoppm:
             raise FaroError(
                 "El PDF no contiene texto extraible y no se encontro pdftoppm para preparar OCR de paginas."
             )
-        max_pages = max(1, min(int(os.getenv("FARO_PDF_OCR_MAX_PAGES", "2") or "2"), 5))
         dpi = max(120, min(int(os.getenv("FARO_PDF_OCR_DPI", "200") or "200"), 300))
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -6630,19 +6804,208 @@ class FaroPhase1Service:
                     + (stderr or stdout or str(completed.returncode))
                 )
             page_texts: list[str] = []
+            processed_pages: list[int] = []
+            ocr_page_texts: list[dict[str, Any]] = []
             for image_path in sorted(tmp_path.glob("page-*.png")):
+                page_match = re.search(r"page-(\d+)\.png$", image_path.name, re.IGNORECASE)
+                page_number = 0
+                if page_match:
+                    page_number = int(page_match.group(1))
+                    processed_pages.append(page_number)
                 page_text = self._extract_purchase_entry_image_text(image_path.read_bytes(), str(image_path))
+                ocr_page_texts.append({"page": page_number or len(ocr_page_texts) + 1, "text": page_text})
                 if page_text.strip():
                     page_texts.append(page_text)
             if not page_texts:
                 raise FaroError("El PDF no contiene texto extraible y el OCR no devolvio texto.")
-            return "\n".join(page_texts)
+            self._last_purchase_entry_ocr_page_texts = ocr_page_texts
+            return "\n".join(page_texts), processed_pages, limit_reached
+
+    def _extract_purchase_entry_pdf_ocr_text(self, data: bytes, source: str) -> str:
+        text, _, _ = self._extract_purchase_entry_pdf_ocr_pages(data, source)
+        return text
+
+    @staticmethod
+    def _purchase_entry_group_layout_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for word in sorted(words, key=lambda item: (dec(item.get("y0")), dec(item.get("x0")))):
+            y0 = dec(word.get("y0"))
+            matched: dict[str, Any] | None = None
+            for row in rows:
+                if abs(dec(row.get("y0")) - y0) <= Decimal("3"):
+                    matched = row
+                    break
+            if matched is None:
+                matched = {"y0": y0, "words": []}
+                rows.append(matched)
+            matched["words"].append(word)
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            row_words = sorted(row["words"], key=lambda item: dec(item.get("x0")))
+            text = " ".join(str(item.get("text") or "") for item in row_words).strip()
+            if not text:
+                continue
+            output.append({
+                "y0": str(row["y0"]),
+                "x0": str(min(dec(item.get("x0")) for item in row_words)),
+                "x1": str(max(dec(item.get("x1")) for item in row_words)),
+                "text": text,
+                "word_count": len(row_words),
+            })
+        return output
+
+    def _extract_purchase_entry_pdf_layout(self, data: bytes) -> dict[str, Any]:
+        try:
+            import pymupdf  # type: ignore
+        except ImportError as exc:
+            try:
+                import fitz as pymupdf  # type: ignore
+            except ImportError:
+                raise FaroError(
+                    "PyMuPDF no esta instalado; instala PyMuPDF>=1.24.0 para extraer layout con coordenadas."
+                ) from exc
+        try:
+            doc = pymupdf.open(stream=data, filetype="pdf")
+        except Exception as exc:
+            raise FaroError("No se pudo abrir el PDF con PyMuPDF: " + str(exc)) from exc
+        pages: list[dict[str, Any]] = []
+        try:
+            for page_index, page in enumerate(doc, start=1):
+                rect = page.rect
+                raw_words = page.get_text("words") or []
+                words: list[dict[str, Any]] = []
+                for raw_word in raw_words:
+                    if len(raw_word) < 5:
+                        continue
+                    words.append({
+                        "x0": str(raw_word[0]),
+                        "y0": str(raw_word[1]),
+                        "x1": str(raw_word[2]),
+                        "y1": str(raw_word[3]),
+                        "text": str(raw_word[4]),
+                    })
+                rows = self._purchase_entry_group_layout_words(words)
+                pages.append({
+                    "page": page_index,
+                    "width": str(getattr(rect, "width", "")),
+                    "height": str(getattr(rect, "height", "")),
+                    "word_count": len(words),
+                    "row_count": len(rows),
+                    "rows": rows,
+                })
+        finally:
+            close = getattr(doc, "close", None)
+            if callable(close):
+                close()
+        return {
+            "engine": "pymupdf",
+            "page_count": len(pages),
+            "pages": pages,
+        }
+
+    @staticmethod
+    def _purchase_entry_layout_text(layout: dict[str, Any]) -> str:
+        lines: list[str] = []
+        for page in layout.get("pages") or []:
+            for row in page.get("rows") or []:
+                text = str(row.get("text") or "").strip()
+                if text:
+                    lines.append(text)
+        return "\n".join(lines)
+
+    @classmethod
+    def _purchase_entry_layout_evidence(cls, layout: dict[str, Any]) -> list[dict[str, Any]]:
+        evidence: list[dict[str, Any]] = []
+        for page in layout.get("pages") or []:
+            page_number = int(page.get("page") or 0)
+            text = "\n".join(str(row.get("text") or "") for row in page.get("rows") or [])
+            if text.strip():
+                evidence.append(cls._purchase_entry_text_evidence(page_number, text, "pymupdf_layout"))
+        return evidence
+
+    @classmethod
+    def _purchase_entry_text_evidence(cls, page: int, text: str, source: str) -> dict[str, Any]:
+        normalized_lines = [
+            re.sub(r"\s+", " ", raw_line).strip()
+            for raw_line in str(text or "").splitlines()
+        ]
+        lines = [line for line in normalized_lines if line]
+        number = r"[-+]?\d+(?:[.,]\d+)?"
+        reference = r"[A-Z0-9][A-Z0-9./_-]{2,24}"
+        candidate_line_count = 0
+        for line in lines:
+            if re.search(rf"\b{reference}\b.+\b{number}\b.+\b{number}\b", line, re.IGNORECASE):
+                candidate_line_count += 1
+        total_label_count = sum(
+            1
+            for line in lines
+            if re.search(r"\b(?:BASE\s+IMPONIBLE|TOTAL\s+FACTURA|TOTAL\s+DOCUMENTO|IVA)\b", line, re.IGNORECASE)
+        )
+        header_label_count = sum(
+            1
+            for line in lines
+            if re.search(r"\b(?:FACTURA|ALBAR[AÁ]N|CIF|NIF|FECHA)\b", line, re.IGNORECASE)
+        )
+        return {
+            "page": page,
+            "source": source,
+            "chars": len(str(text or "")),
+            "lines": len(lines),
+            "candidate_line_count": candidate_line_count,
+            "total_label_count": total_label_count,
+            "header_label_count": header_label_count,
+            "has_detail_signal": candidate_line_count > 0,
+            "has_total_signal": total_label_count > 0,
+        }
+
+    @classmethod
+    def _purchase_entry_extraction_evidence(
+        cls, page_count: int, processed_pages: list[int], page_evidence: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        processed_set = {int(page) for page in processed_pages}
+        detail_pages = sorted({
+            int(item.get("page") or 0)
+            for item in page_evidence
+            if int(item.get("page") or 0) and int(item.get("candidate_line_count") or 0) > 0
+        })
+        total_pages = sorted({
+            int(item.get("page") or 0)
+            for item in page_evidence
+            if int(item.get("page") or 0) and int(item.get("total_label_count") or 0) > 0
+        })
+        header_pages = sorted({
+            int(item.get("page") or 0)
+            for item in page_evidence
+            if int(item.get("page") or 0) and int(item.get("header_label_count") or 0) > 0
+        })
+        unprocessed_pages = [page for page in range(1, int(page_count or 0) + 1) if page not in processed_set]
+        return {
+            "page_count": page_count,
+            "processed_pages": sorted(processed_set),
+            "unprocessed_pages": unprocessed_pages,
+            "detail_pages": detail_pages,
+            "total_pages": total_pages,
+            "header_pages": header_pages,
+            "detail_signal_count": sum(int(item.get("candidate_line_count") or 0) for item in page_evidence),
+            "total_signal_count": sum(int(item.get("total_label_count") or 0) for item in page_evidence),
+            "header_signal_count": sum(int(item.get("header_label_count") or 0) for item in page_evidence),
+            "pages": page_evidence,
+        }
 
     def _purchase_entry_pdf_text(self, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if args.get("texto_extraido"):
             text = str(args.get("texto_extraido") or "")
             source = str(args.get("nombre_fichero") or args.get("ruta_imagen") or args.get("ruta_pdf") or "documento")
-            return text, {"origen": source, "bytes": 0, "formato": "texto"}
+            page_evidence = [self._purchase_entry_text_evidence(1, text, "texto_extraido")]
+            return text, {
+                "origen": source,
+                "bytes": 0,
+                "formato": "texto",
+                "page_count": 1,
+                "processed_pages": [1],
+                "extraction_incomplete": False,
+                "evidence": self._purchase_entry_extraction_evidence(1, [1], page_evidence),
+            }
         if args.get("content_base64"):
             try:
                 data = base64.b64decode(str(args.get("content_base64")), validate=True)
@@ -6671,24 +7034,165 @@ class FaroPhase1Service:
             raise FaroError("Debe informar ruta_pdf, ruta_imagen, content_base64, content_base64_imagen o texto_extraido")
         kind, suffix = self._purchase_entry_document_kind(data, source)
         extraction = "ocr"
+        layout: dict[str, Any] | None = None
+        layout_error = ""
         if kind == "pdf":
             try:
                 from pypdf import PdfReader
                 import io
 
                 reader = PdfReader(io.BytesIO(data))
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                page_texts = [page.extract_text() or "" for page in reader.pages]
+                page_count = len(page_texts)
+                try:
+                    layout = self._extract_purchase_entry_pdf_layout(data)
+                except FaroError as exc:
+                    layout_error = str(exc)
+                blank_pages = [index + 1 for index, page_text in enumerate(page_texts) if not page_text.strip()]
+                text = "\n".join(page_texts)
+                page_evidence = [
+                    self._purchase_entry_text_evidence(index + 1, page_text, "texto_pdf")
+                    for index, page_text in enumerate(page_texts)
+                    if page_text.strip()
+                ]
                 extraction = "texto_pdf"
+                if layout:
+                    layout_text = self._purchase_entry_layout_text(layout)
+                    layout_evidence = self._purchase_entry_layout_evidence(layout)
+                    native_detail_count = sum(int(item.get("candidate_line_count") or 0) for item in page_evidence)
+                    layout_detail_count = sum(int(item.get("candidate_line_count") or 0) for item in layout_evidence)
+                    if (
+                        layout_text.strip()
+                        and layout_detail_count > 0
+                        and (layout_detail_count > native_detail_count or layout_text not in text)
+                    ):
+                        text = "\n".join(part for part in (text, layout_text) if part.strip())
+                        page_evidence.extend(layout_evidence)
+                        extraction = "texto_pdf+pymupdf_layout"
+                extraction_incomplete = False
+                extraction_error = ""
+                processed_pages_override: list[int] | None = None
                 if not text.strip():
-                    text = self._extract_purchase_entry_pdf_ocr_text(data, source)
+                    text, ocr_pages, page_limit_reached = self._extract_purchase_entry_pdf_ocr_pages(
+                        data, source, page_count
+                    )
                     extraction = "ocr_pdf"
+                    blank_pages = []
+                    processed_pages_override = ocr_pages
+                    page_evidence = [
+                        self._purchase_entry_text_evidence(
+                            int(item.get("page") or 0), str(item.get("text") or ""), "ocr_pdf"
+                        )
+                        for item in getattr(self, "_last_purchase_entry_ocr_page_texts", [])
+                        if str(item.get("text") or "").strip()
+                    ]
+                    extraction_incomplete = page_limit_reached
+                    if page_limit_reached:
+                        extraction_error = f"OCR limitado a {len(ocr_pages)} de {page_count} paginas"
+                elif blank_pages:
+                    try:
+                        ocr_text, ocr_pages, page_limit_reached = self._extract_purchase_entry_pdf_ocr_pages(
+                            data, source, page_count
+                        )
+                        if ocr_text.strip():
+                            text = "\n".join(part for part in (text, ocr_text) if part.strip())
+                            extraction = "texto_pdf+ocr_pdf"
+                            blank_pages = []
+                            native_pages = [
+                                index + 1 for index, page_text in enumerate(page_texts) if page_text.strip()
+                            ]
+                            processed_pages_override = sorted(set(native_pages) | set(ocr_pages))
+                            page_evidence.extend(
+                                self._purchase_entry_text_evidence(
+                                    int(item.get("page") or 0), str(item.get("text") or ""), "ocr_pdf"
+                                )
+                                for item in getattr(self, "_last_purchase_entry_ocr_page_texts", [])
+                                if str(item.get("text") or "").strip()
+                            )
+                            if page_limit_reached:
+                                extraction_incomplete = True
+                                extraction_error = f"OCR limitado a {len(ocr_pages)} de {page_count} paginas"
+                    except FaroError as exc:
+                        extraction_incomplete = True
+                        extraction_error = str(exc)
+                elif len(text.strip()) < int(os.getenv("FARO_PDF_NATIVE_TEXT_MIN_CHARS", "500") or "500"):
+                    try:
+                        ocr_text, ocr_pages, page_limit_reached = self._extract_purchase_entry_pdf_ocr_pages(
+                            data, source, page_count
+                        )
+                        if ocr_text.strip():
+                            text = "\n".join(part for part in (text, ocr_text) if part.strip())
+                            extraction = "texto_pdf+ocr_pdf"
+                            native_pages = [
+                                index + 1 for index, page_text in enumerate(page_texts) if page_text.strip()
+                            ]
+                            processed_pages_override = sorted(set(native_pages) | set(ocr_pages))
+                            page_evidence.extend(
+                                self._purchase_entry_text_evidence(
+                                    int(item.get("page") or 0), str(item.get("text") or ""), "ocr_pdf"
+                                )
+                                for item in getattr(self, "_last_purchase_entry_ocr_page_texts", [])
+                                if str(item.get("text") or "").strip()
+                            )
+                            if page_limit_reached:
+                                extraction_incomplete = True
+                                extraction_error = f"OCR limitado a {len(ocr_pages)} de {page_count} paginas"
+                    except FaroError:
+                        pass
             except ImportError as exc:
                 raise FaroError("Para extraer PDF instala pypdf en el entorno del MCP") from exc
             except Exception as exc:
                 raise FaroError("No se pudo extraer texto del PDF: " + str(exc)) from exc
         else:
             text = self._extract_purchase_entry_image_text(data, source)
-        return text, {"origen": source, "bytes": len(data), "formato": kind, "extension": suffix, "extraccion": extraction}
+            page_count = 1
+            blank_pages = []
+            processed_pages_override = None
+            extraction_incomplete = False
+            extraction_error = ""
+            page_evidence = [self._purchase_entry_text_evidence(1, text, "ocr_imagen")]
+        processed_pages = [
+            page for page in range(1, page_count + 1)
+            if page not in set(blank_pages)
+        ]
+        if processed_pages_override is not None:
+            processed_pages = processed_pages_override
+        evidence = self._purchase_entry_extraction_evidence(page_count, processed_pages, page_evidence)
+        meta = {
+            "origen": source,
+            "bytes": len(data),
+            "formato": kind,
+            "extension": suffix,
+            "extraccion": extraction,
+            "page_count": page_count,
+            "processed_pages": processed_pages,
+            "extraction_incomplete": extraction_incomplete,
+            "evidence": evidence,
+        }
+        if blank_pages:
+            meta["blank_pages"] = blank_pages
+        if extraction_error:
+            meta["extraction_error"] = extraction_error
+        if "limitado a" in extraction_error:
+            meta["page_limit_reached"] = True
+        if layout:
+            meta["layout"] = {
+                "engine": layout.get("engine"),
+                "page_count": layout.get("page_count"),
+                "pages": [
+                    {
+                        "page": page.get("page"),
+                        "width": page.get("width"),
+                        "height": page.get("height"),
+                        "word_count": page.get("word_count"),
+                        "row_count": page.get("row_count"),
+                    }
+                    for page in layout.get("pages") or []
+                ],
+            }
+        elif layout_error:
+            meta["layout_error"] = layout_error
+        return text, meta
 
     def _purchase_entry_pdf_bytes(self, args: dict[str, Any]) -> tuple[bytes, str]:
         if args.get("content_base64"):
@@ -6717,22 +7221,43 @@ class FaroPhase1Service:
         proveedor = int(cabecera.get("proveedor") or 0)
         if proveedor:
             return proveedor
+        tax_ids: list[str] = []
+        for value in cabecera.get("cif_candidatos") or []:
+            cleaned = self._clean_purchase_tax_id(str(value))
+            if cleaned and cleaned not in tax_ids:
+                tax_ids.append(cleaned)
         if cabecera.get("cif"):
+            cleaned = self._clean_purchase_tax_id(str(cabecera.get("cif")))
+            if cleaned and cleaned not in tax_ids:
+                tax_ids.append(cleaned)
+        for tax_id in tax_ids:
             try:
-                provider = self._resolve_purchase_provider({"proveedor": 0, "cif": cabecera["cif"]})
+                if self._is_own_company_tax_id(tax_id):
+                    warnings.append("CIF/NIF extraido corresponde a la empresa propia; se ignora para resolver proveedor.")
+                    continue
+                provider = self._resolve_purchase_provider({"proveedor": 0, "cif": tax_id})
                 if self._is_own_company_provider(provider):
                     warnings.append("CIF/NIF extraido corresponde a la empresa propia; se ignora para resolver proveedor.")
-                    raise FaroError("CIF/NIF extraido corresponde a la empresa propia")
+                    continue
                 cabecera["proveedor"] = provider["codpro"]
+                cabecera["cif"] = provider.get("cif") or tax_id
+                warnings[:] = [
+                    warning for warning in warnings
+                    if not str(warning).startswith("No se pudo resolver proveedor por ")
+                ]
                 return int(provider["codpro"])
             except Exception as exc:
-                warnings.append(f"No se pudo resolver proveedor por CIF/NIF extraido: {exc}")
+                warnings.append(f"No se pudo resolver proveedor por CIF/NIF extraido {tax_id}: {exc}")
         provider_name = str(cabecera.get("nombre_proveedor") or "").strip()
         if provider_name:
             provider = self._resolve_purchase_provider_by_name(provider_name)
             if provider:
                 cabecera["proveedor"] = provider["codpro"]
                 cabecera["cif"] = provider.get("cif") or cabecera.get("cif") or ""
+                warnings[:] = [
+                    warning for warning in warnings
+                    if not str(warning).startswith("No se pudo resolver proveedor por ")
+                ]
                 return int(provider["codpro"])
             warnings.append(f"No se pudo resolver proveedor por nombre extraido: {provider_name}")
         return 0
@@ -6759,6 +7284,24 @@ class FaroPhase1Service:
         candidate = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
         match = re.search(r"(?:[A-Z]\d{7}[A-Z0-9]|\d{8}[A-Z]|[A-Z]\d{8})", candidate)
         return match.group(0) if match else candidate[:15]
+
+    @classmethod
+    def _extract_purchase_tax_ids(cls, text: str) -> list[str]:
+        ignored_candidates = {"CIF", "NIF", "VAT", "EMAIL", "E", "MAIL"}
+        tax_ids: list[str] = []
+        for match in re.finditer(
+            r"\b(?:C\.?\s*I\.?\s*F\.?|N\.?\s*I\.?\s*F\.?|VAT)\s*[:\-]?\s*([A-Z0-9][A-Z0-9 .\-]{2,15})",
+            str(text or ""),
+            re.IGNORECASE,
+        ):
+            candidate = cls._clean_purchase_tax_id(match.group(1))
+            if candidate and candidate not in ignored_candidates and candidate not in tax_ids:
+                tax_ids.append(candidate)
+        for match in re.finditer(r"\b(?:[A-Z]\d{8}|\d{8}[A-Z]|[A-Z]\d{7}[A-Z0-9])\b", str(text or "").upper()):
+            candidate = cls._clean_purchase_tax_id(match.group(0))
+            if candidate and candidate not in ignored_candidates and candidate not in tax_ids:
+                tax_ids.append(candidate)
+        return tax_ids
 
     def _own_company_identity(self) -> dict[str, Any]:
         if self._own_company_identity_cache is not None:
@@ -6809,6 +7352,34 @@ class FaroPhase1Service:
             "PRECIO", "IMPORTE", "OBSERVACIONES", "TRANSFERENCIA", "TELEFONO", "FAX", "NIF",
             "CIF", "IVA", "TOTAL", "PAGINA",
         }
+        lines = [re.sub(r"\s+", " ", raw_line).strip(" -:\t") for raw_line in str(text or "").splitlines()]
+        for marker_index, line in enumerate(lines[:80]):
+            if not re.search(r"\bCOD\.?\s*CLIENTE\b|\bCODIGO\s+CLIENTE\b", line, re.IGNORECASE):
+                continue
+            window = lines[marker_index + 1: marker_index + 35]
+            for index, candidate_line in enumerate(window):
+                if not candidate_line or re.search(r"^(%?\s*DTO\.?\s*PRECIO|COD\.?\s*CLIENTE|CODIGO\s+CLIENTE)$", candidate_line, re.IGNORECASE):
+                    continue
+                if re.search(r"^(---|DESCRIPCION|B\.?IMPONIBLE|FORMA\s+PAGO|VENCIMIENTOS)", candidate_line, re.IGNORECASE):
+                    break
+                candidates = [candidate_line]
+                if index + 1 < len(window):
+                    candidates.append(candidate_line + " " + window[index + 1])
+                for raw_candidate in candidates:
+                    match = re.search(
+                        r"([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ0-9&.,' -]{1,70}?\bS\.?\s*(?:L|A)\.?(?:\s*U\.?)?)",
+                        raw_candidate,
+                        re.IGNORECASE,
+                    )
+                    candidate = (match.group(1) if match else raw_candidate).strip(" -:\t")
+                    candidate = re.sub(r"\bS\.?\s*L\.?\s*C\s*/.*$", "S.L.", candidate, flags=re.IGNORECASE)
+                    normalized = self._normalize_party_name(candidate)
+                    if self._is_own_company_text(candidate):
+                        continue
+                    if normalized in blocked_words or any(normalized.startswith(f"{word} ") for word in blocked_words):
+                        continue
+                    if self._purchase_provider_name_tokens(candidate) and re.search(r"\bS\.?\s*(?:L|A)\.?\b|\bSL\b|\bSA\b", candidate, re.IGNORECASE):
+                        return candidate
         compact_text = re.sub(r"\s+", " ", str(text or "")).strip()
         for match in re.finditer(
             r"\b([A-ZÁÉÍÓÚÜÑ][A-ZÁÉÍÓÚÜÑ0-9&.,' -]{1,70}?\bS\.?\s*(?:L|A)\.?(?:\s*U\.?)?)\b",
@@ -6887,6 +7458,17 @@ class FaroPhase1Service:
         lines = [re.sub(r"\s+", " ", raw_line).strip() for raw_line in text.splitlines()]
         marker = r"(?:N[º°O]?\s*\.?|NO\.?|NUM(?:ERO)?\.?|#)"
         compact_text = re.sub(r"\s+", " ", str(text or "")).strip()
+        for line in lines:
+            explicit_line_match = re.search(
+                rf"\b(?:FACTURA|FRA\.?|INVOICE)\s*{marker}\s*[:\-]?\s*"
+                r"([A-Z0-9][A-Z0-9.\-]{1,24}(?:\s*/\s*[A-Z0-9][A-Z0-9.\-]{0,12})?|[A-Z0-9][A-Z0-9./\-]{1,30})",
+                line,
+                re.IGNORECASE,
+            )
+            if explicit_line_match:
+                candidate = self._clean_purchase_document_reference(explicit_line_match.group(1))
+                if candidate:
+                    return candidate
         labeled_row_match = re.search(
             r"\bCliente\s*:?\s+Factura\s*:?\s+Fecha\s*:?\s+N\.?\s*I\.?\s*F\.?\s*:?\s+"
             r"\S+\s+([A-Z0-9][A-Z0-9./\-]{1,30})\s+"
@@ -6959,6 +7541,11 @@ class FaroPhase1Service:
                 return candidate
         for index, line in enumerate(lines):
             if not re.search(r"\b(?:FACTURA|FRA\.?|INVOICE)\b", line, re.IGNORECASE):
+                continue
+            if (
+                re.search(r"\bFECHA\s+(?:DE\s+)?FACTURA\b", line, re.IGNORECASE)
+                and not re.search(r"\b(?:N[º°O]?|NO\.?|NUM(?:ERO)?\.?|#)\s*FACTURA\b", line, re.IGNORECASE)
+            ):
                 continue
             if re.search(r"\bFACTURA\s+NUM(?:ERO)?\b", line, re.IGNORECASE) and index + 1 < len(lines):
                 next_parts = lines[index + 1].split()
@@ -7045,35 +7632,191 @@ class FaroPhase1Service:
             raise FaroError("politica_precio_compra debe ser 'mantener', 'actualizar' o 'actualizar_si_sube'")
         return policy
 
+    @staticmethod
+    def _dedupe_purchase_entry_pdf_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        positions: dict[tuple[str, str, str, str], int] = {}
+        semantic_positions: dict[tuple[str, str], int] = {}
+
+        def line_consistency_score(item: dict[str, Any]) -> tuple[int, int, int]:
+            amount = item.get("importe_origen")
+            has_amount = amount not in (None, "")
+            score = 0
+            if has_amount:
+                expected = FaroPhase1Service._purchase_pdf_line_net_amount(item)
+                raw_amount = FaroPhase1Service._parse_pdf_number(str(amount))
+                if abs(expected - raw_amount) <= Decimal("0.02"):
+                    score += 4
+                else:
+                    score -= 2
+            if item.get("iva") not in (None, ""):
+                score += 2
+            if item.get("resuelto"):
+                score += 1
+            return (score, 1 if has_amount else 0, len(str(item.get("descripcion") or "")))
+
+        for item in candidates:
+            key = (
+                str(item.get("referencia_proveedor") or "").strip().upper(),
+                re.sub(r"\s+", " ", str(item.get("descripcion") or "").strip()).upper(),
+                str(item.get("cantidad") or "").strip(),
+                str(item.get("precio") or "").strip(),
+            )
+            if key in positions:
+                current = result[positions[key]]
+                if not current.get("importe_origen") and item.get("importe_origen"):
+                    current["importe_origen"] = item["importe_origen"]
+                continue
+            semantic_key = (
+                str(item.get("referencia_proveedor") or "").strip().upper(),
+                re.sub(r"\s+", " ", str(item.get("descripcion") or "").strip()).upper(),
+            )
+            if semantic_key in semantic_positions:
+                current_index = semantic_positions[semantic_key]
+                current = result[current_index]
+                if line_consistency_score(item) > line_consistency_score(current):
+                    old_key = (
+                        str(current.get("referencia_proveedor") or "").strip().upper(),
+                        re.sub(r"\s+", " ", str(current.get("descripcion") or "").strip()).upper(),
+                        str(current.get("cantidad") or "").strip(),
+                        str(current.get("precio") or "").strip(),
+                    )
+                    positions.pop(old_key, None)
+                    result[current_index] = item
+                    positions[key] = current_index
+                continue
+            positions[key] = len(result)
+            semantic_positions[semantic_key] = len(result)
+            result.append(item)
+        return result
+
     def purchase_entry_pdf_proposal(self, args: dict[str, Any]) -> dict[str, Any]:
         text, meta = self._purchase_entry_pdf_text(args)
+        document_hash = self._purchase_entry_document_hash(args)
         warnings = [
             "La extraccion de documento es heuristica: revisa proveedor, albaran/factura, cantidades y precios antes de grabar.",
             "La grabacion final reutiliza entrada_almacen_crear, validada contra CABDOCM_UDM.pas y MNTDOCM_U.pas.",
         ]
-        cif_match = re.search(r"\b(?:C\.?\s*I\.?\s*F\.?|N\.?\s*I\.?\s*F\.?|VAT)\s*[:\-]?\s*([A-Z0-9][A-Z0-9 .\-]{2,15})", text, re.IGNORECASE)
+        tax_ids = self._extract_purchase_tax_ids(text)
+        first_external_tax_id = next((tax_id for tax_id in tax_ids if not self._is_own_company_tax_id(tax_id)), "")
         invoice_number = self._extract_purchase_invoice_number(text)
         delivery_number = self._extract_purchase_delivery_number(text)
         parsed_date = self._extract_purchase_pdf_date(text)
         cabecera: dict[str, Any] = {
             "centro": int(args.get("centro", self.settings.centro)),
             "proveedor": int(args.get("proveedor") or 0) or None,
-            "cif": self._clean_purchase_tax_id(cif_match.group(1)) if cif_match else "",
+            "cif": first_external_tax_id or (tax_ids[0] if tax_ids else ""),
+            "cif_candidatos": tax_ids,
             "nombre_proveedor": self._extract_purchase_provider_name(text),
             "factura": invoice_number,
             "albaran": delivery_number,
             "fecha": args.get("fecha") or parsed_date or date.today().isoformat(),
             "observaciones": "Entrada propuesta desde documento",
         }
-        if cabecera["factura"]:
-            cabecera["fecha_factura"] = args.get("fecha_factura") or parsed_date or cabecera["fecha"]
+        if cabecera["factura"] and (args.get("fecha_factura") or parsed_date):
+            cabecera["fecha_factura"] = args.get("fecha_factura") or parsed_date
+        elif cabecera["factura"]:
+            warnings.append("fecha_factura_no_detectada")
         provider_code = self._resolve_purchase_entry_pdf_provider(cabecera, warnings)
         candidates: list[dict[str, Any]] = []
         limit = max(1, min(int(args.get("limite_lineas", 100) or 100), 500))
         number = r"[-+]?\d+(?:[.,]\d+)?"
         line_re = re.compile(rf"^\s*([A-Z0-9][A-Z0-9./_-]{{2,24}})\s+(.+?)\s+({number})\s+({number})(?:\s+({number}))?\s*$")
+        amount_re = re.compile(rf"^{number}$")
+        money_amount_re = re.compile(r"^[-+]?\d+[.,]\d{2}$")
 
-        def add_candidate(reference: str, description: str, quantity: str, price: str, tax: str | None = None) -> None:
+        def split_glued_amounts(value: str) -> tuple[str, str] | None:
+            raw = str(value or "").strip()
+            for index in range(1, len(raw)):
+                left = raw[:index]
+                right = raw[index:]
+                if money_amount_re.match(left) and money_amount_re.match(right):
+                    return left, right
+            return None
+
+        def split_lucemar_amount_reference(value: str) -> tuple[str, str] | None:
+            raw = str(value or "").strip()
+            match = re.match(r"^(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})([A-Z0-9]{6,14})$", raw, re.IGNORECASE)
+            if not match:
+                return None
+            return match.group(1), match.group(2)
+
+        def split_lucemar_price_quantity(value: str) -> tuple[str, str] | None:
+            raw = str(value or "").strip()
+            dotted_quantity = re.match(r"^(\d+(?:[.,]\d{4}))(\d(?:\.\d{3})+)$", raw)
+            if dotted_quantity:
+                return dotted_quantity.group(1), dotted_quantity.group(2).replace(".", "")
+            match = re.match(r"^(\d+(?:[.,]\d{4})?)\.?(\d+)$", raw)
+            if not match:
+                return None
+            return match.group(1), match.group(2)
+
+        def add_lucemar_candidate_from_parts(parts: list[str]) -> bool:
+            if len(parts) < 4:
+                return False
+            quantity: str | None = None
+            price: str | None = None
+            discount: str | None = None
+            amount_reference: str | None = None
+            description_parts: list[str] = []
+            no_reference_match = re.match(r"^(\d+,\d{2})(\d+,\d{4})(\d+)$", parts[-1])
+            if no_reference_match and provider_code:
+                description = re.sub(r"^%\s*", "", " ".join(parts[:-1]).strip()).strip()
+                row = self.db.fetch_one(
+                    "SELECT FIRST 1 P.* FROM ARTICUL A, ARTICULP P "
+                    "WHERE A.ART_NUMEMP=P.ARTP_NUMEMP AND A.ART_CODART=P.ARTP_CODART "
+                    "AND A.ART_NUMEMP=? AND P.ARTP_CODPRO=? AND UPPER(A.ART_DESCRI)=?",
+                    (self.settings.empresa, int(provider_code), description.upper()),
+                )
+                supplier_row = normalize(row) if row else {}
+                reference = str(supplier_row.get("ARTP_REFPRO") or supplier_row.get("ARTP_CODART") or "").strip()
+                if reference:
+                    amount, price, quantity = no_reference_match.groups()
+                    add_candidate(reference, description, quantity, price, "21", None, amount)
+                    return True
+            offer_match = re.match(r"^OFE(\d+)$", parts[-1], re.IGNORECASE)
+            if offer_match and len(parts) >= 4 and amount_re.match(parts[-2]):
+                quantity = offer_match.group(1)
+                price = parts[-2]
+                amount_reference = parts[-3]
+                description_parts = parts[:-3]
+            elif re.match(r"^\d{2,3}$", parts[-1]) and len(parts) >= 4 and amount_re.match(parts[-2]):
+                discount_quantity = parts[-1]
+                quantity = discount_quantity[-1]
+                discount = discount_quantity[:-1] or None
+                price = parts[-2]
+                amount_reference = parts[-3]
+                description_parts = parts[:-3]
+            else:
+                price_quantity = split_lucemar_price_quantity(parts[-1])
+                if price_quantity and len(parts) >= 3:
+                    price, quantity = price_quantity
+                    amount_reference = parts[-2]
+                    description_parts = parts[:-2]
+            if not quantity or not price or not amount_reference or not description_parts:
+                return False
+            amount_reference_split = split_lucemar_amount_reference(amount_reference)
+            if not amount_reference_split:
+                return False
+            amount, reference = amount_reference_split
+            description = " ".join(description_parts).strip()
+            description = re.sub(r"^%\s*", "", description).strip()
+            if not description or re.search(r"^---|^(B\.?IMPONIBLE|FORMA\s+PAGO|VENCIMIENTOS|OBSERVACIONES)\b", description, re.IGNORECASE):
+                return False
+            add_candidate(reference, description, quantity, price, "21", discount, amount)
+            return True
+
+        def add_candidate(
+            reference: str,
+            description: str,
+            quantity: str,
+            price: str,
+            tax: str | None = None,
+            discount: str | None = None,
+            amount: str | None = None,
+        ) -> None:
+            if not is_purchase_detail_candidate(reference, description):
+                return
             item: dict[str, Any] = {
                 "referencia_proveedor": reference,
                 "descripcion": description[:100],
@@ -7081,30 +7824,217 @@ class FaroPhase1Service:
                 "precio": str(self._parse_pdf_number(price)),
                 "resuelto": False,
             }
+            if discount is not None:
+                item["descuento1"] = str(self._parse_pdf_number(discount))
+            if amount is not None:
+                item["importe_origen"] = str(self._parse_pdf_number(amount))
             if tax:
                 parsed_tax = self._parse_pdf_number(tax)
                 if parsed_tax in {Decimal("0"), Decimal("4"), Decimal("5"), Decimal("10"), Decimal("21")}:
                     item["iva"] = str(parsed_tax)
             if provider_code:
-                row = self._supplier_article_for_entry(reference, provider_code)
-                if row and row.get("ARTP_CODART"):
-                    item["articulo"] = str(row.get("ARTP_CODART") or "").strip()
-                    item["unidad_medida"] = str(row.get("ARTP_UNIMED") or "").strip()
-                    item["resuelto"] = True
+                if re.match(r"^I[A-Z0-9][A-Z0-9./_-]+$", str(reference or ""), re.IGNORECASE):
+                    lookup_references = [f"1{str(reference)[1:]}", reference]
                 else:
+                    lookup_references = [reference]
+                for lookup_reference in lookup_references:
+                    row = self._supplier_article_for_entry(lookup_reference, provider_code)
+                    if row and row.get("ARTP_CODART"):
+                        item["referencia_proveedor"] = lookup_reference
+                        item["articulo"] = str(row.get("ARTP_CODART") or "").strip()
+                        item["unidad_medida"] = str(row.get("ARTP_UNIMED") or "").strip()
+                        item["resuelto"] = True
+                        break
+                    article = self._internal_article_for_entry(lookup_reference)
+                    if article and article.get("ART_CODART"):
+                        item["referencia_proveedor"] = lookup_reference
+                        item["articulo"] = str(article.get("ART_CODART") or "").strip()
+                        item["unidad_medida"] = str(article.get("ART_UNIMED") or "").strip()
+                        item["resuelto"] = True
+                        break
+                if not item.get("resuelto"):
                     item["error"] = "Referencia de proveedor no encontrada en ARTICULP"
             candidates.append(item)
 
+        def is_purchase_detail_candidate(reference: str, description: str) -> bool:
+            ref = str(reference or "").strip()
+            desc = str(description or "").strip()
+            combined = f"{ref} {desc}".strip()
+            if not ref or not desc:
+                return False
+            if re.match(
+                r"^(FORMA|PAGO|VENCIMIENTOS?|OBSERVACIONES?|B\.?IMPONIBLE|BASE|TOTAL|IVA|IMPORTE|PORTES|CIF|FECHA|FACTURA|CLIENTE|PROVEEDOR)$",
+                ref,
+                re.IGNORECASE,
+            ):
+                return False
+            if re.match(r"^ES\d{2}$", ref, re.IGNORECASE) and re.search(r"\b\d{4}\b", desc):
+                return False
+            if re.match(r"^(SOCIEDAD|UNIPERSONAL|INSCRIPCI[OÓ]N|REGISTRO|MERCANTIL|TOMO|LIBRO|FOLIO|SECCI[OÓ]N|HOJA)$", ref, re.IGNORECASE):
+                return False
+            if re.search(
+                r"\b(FORMA\s+PAGO|PAGARE|PAGAR[EÉ]|VENCIMIENTOS?|B\.?IMPONIBLE|BASE\s+IMPONIBLE|TOTAL\s+FACTURA|CUOTA\s+IVA|CCC|IBAN|REGISTRO\s+MERCANTIL)\b",
+                combined,
+                re.IGNORECASE,
+            ):
+                return False
+            return True
+
+        def ocr_number_spacing(value: str) -> str:
+            return re.sub(r"(?<=\d),\s+(?=\d)", ",", str(value or ""))
+
+        def leading_numbers(value: str) -> list[str]:
+            numbers: list[str] = []
+            for part in str(value or "").split():
+                if amount_re.match(part):
+                    numbers.append(part)
+                    continue
+                break
+            return numbers
+
+        def split_faren_columnar_descriptions(value: str, expected_count: int) -> list[str]:
+            clean = re.sub(r"\s+", " ", str(value or "")).strip()
+            if expected_count <= 0 or not clean:
+                return []
+            if expected_count == 1:
+                return [clean]
+            ral_match = re.match(r"^(.+?)\s+(RAL\s+\d+\s+.+?)\s+([A-Z0-9][A-Z0-9./_-]{1,24})$", clean, re.IGNORECASE)
+            if expected_count == 3 and ral_match:
+                return [ral_match.group(1).strip(), ral_match.group(2).strip(), ral_match.group(3).strip()]
+            tokens = clean.split()
+            chunk_size = max(1, len(tokens) // expected_count)
+            descriptions: list[str] = []
+            for index in range(expected_count):
+                if index == expected_count - 1:
+                    chunk = tokens[index * chunk_size :]
+                else:
+                    chunk = tokens[index * chunk_size : (index + 1) * chunk_size]
+                descriptions.append(" ".join(chunk).strip())
+            return descriptions
+
+        def add_faren_columnar_candidates(source_text: str) -> bool:
+            compact = ocr_number_spacing(re.sub(r"\s+", " ", source_text or " "))
+            taric_match = re.search(r"\bTARIC\s+COD\.?\b", compact, re.IGNORECASE)
+            quantity_match = re.search(r"\bCANTIDAD\b", compact, re.IGNORECASE)
+            price_match = re.search(r"\bPRECIO\s+UDAD\b", compact, re.IGNORECASE)
+            amount_match = re.search(r"\bIMPORTE\b", compact, re.IGNORECASE)
+            if not taric_match or not quantity_match or not price_match or not amount_match:
+                return False
+            code_index = compact.rfind("CODIGO", 0, taric_match.start())
+            code_refs: list[str] = []
+            if code_index >= 0:
+                code_segment = compact[code_index + len("CODIGO") : taric_match.start()]
+                code_refs = [
+                    token for token in re.findall(r"\b[A-Z0-9][A-Z0-9./_-]{2,24}\b", code_segment, re.IGNORECASE)
+                    if not re.fullmatch(r"(CLIENTE|CUENTE|FECHA|BANCO)", token, re.IGNORECASE)
+                ]
+            tarics = re.findall(r"\b\d{8,12}\b", compact[taric_match.end() : quantity_match.start()])
+            quantity_end_match = re.search(r"\b(?:BULTOS|PRECIO\s+UDAD)\b", compact[quantity_match.end() :], re.IGNORECASE)
+            quantity_end = quantity_match.end() + quantity_end_match.start() if quantity_end_match else price_match.start()
+            quantities = re.findall(number, compact[quantity_match.end() : quantity_end])
+            price_segment = compact[price_match.end() : amount_match.start()]
+            prices = leading_numbers(price_segment)
+            count = min(len(quantities), len(prices), max(len(tarics), len(code_refs), 0))
+            if count <= 0:
+                return False
+            quantities = quantities[:count]
+            prices = prices[:count]
+            tarics = tarics[:count]
+            price_tail = price_segment
+            for price in prices:
+                price_tail = re.sub(rf"^\s*{re.escape(price)}\s*", "", price_tail, count=1)
+            description_segment = re.split(r"\bAUTORIZACION\b", price_tail, maxsplit=1, flags=re.IGNORECASE)[0]
+            descriptions = split_faren_columnar_descriptions(description_segment, count)
+            if len(descriptions) < count:
+                return False
+            if len(code_refs) >= count:
+                references = code_refs[:count]
+            elif len(code_refs) == count - 1 and count == 3 and tarics:
+                references = [code_refs[0], tarics[1], code_refs[1]]
+            else:
+                references = [
+                    code_refs[index] if index < len(code_refs) else (tarics[index] if index < len(tarics) else "")
+                    for index in range(count)
+                ]
+            discount_segment_start = compact.find("AUTORIZACION", price_match.end())
+            discount_segment = compact[discount_segment_start:amount_match.start()] if discount_segment_start >= 0 else compact[price_match.end() : amount_match.start()]
+            discount_values = [value.rstrip("%") for value in re.findall(r"\b\d+(?:[.,]\d+)?%", discount_segment)]
+            before_count = len(candidates)
+            for index in range(count):
+                reference = references[index]
+                description = descriptions[index]
+                if not reference or not description:
+                    continue
+                discount = discount_values[index] if index < len(discount_values) else None
+                add_candidate(reference, description, quantities[index], prices[index], "21", discount, None)
+            return len(candidates) > before_count
+
+        line_limit_reached = False
+        add_faren_columnar_candidates(text)
         for raw_line in text.splitlines():
             clean = re.sub(r"\s+", " ", raw_line).strip()
+            clean = re.sub(
+                r"^(?:SOCIEDAD|UNIPERSONAL|INSCRIPCI.?N|REGISTRO|MERCANTIL|TOMO|LIBRO|FOLIO|SECCI.?N|HOJA|1.?,)\s+",
+                "",
+                clean,
+                flags=re.IGNORECASE,
+            )
             if len(clean) < 8:
                 continue
+            parts = clean.split()
+            if len(parts) >= 7 and re.match(r"^\d{2}/\d{2}/\d{4}$", parts[0]) and re.match(r"^\d{5,}$", parts[1]):
+                glued_amounts = split_glued_amounts(parts[-1])
+                if glued_amounts and amount_re.match(parts[-2]):
+                    reference = parts[2]
+                    description = " ".join(parts[3:-2])
+                    _, amount = glued_amounts
+                    add_candidate(reference, description, "1", amount, "21", None, amount)
+                    if len(candidates) > limit:
+                        line_limit_reached = True
+                        break
+                    continue
+            fuel_match = re.search(rf"\bCARGO\s+COMBUSTIBLE\b.*?\bIMP\.?\s*CARGO\s+({number})", clean, re.IGNORECASE)
+            if fuel_match:
+                amount = fuel_match.group(1)
+                add_candidate("CARGO_COMBUSTIBLE", "CARGO COMBUSTIBLE", "1", amount, "21", None, amount)
+                if len(candidates) > limit:
+                    line_limit_reached = True
+                    break
+                continue
+            if add_lucemar_candidate_from_parts(parts):
+                if len(candidates) > limit:
+                    line_limit_reached = True
+                    break
+                continue
+            if len(parts) >= 6 and re.match(r"^[A-Z0-9][A-Z0-9./_-]{2,24}$", parts[0], re.IGNORECASE):
+                numeric_tail: list[str] = []
+                for part in reversed(parts[1:]):
+                    if amount_re.match(part):
+                        numeric_tail.insert(0, part)
+                        continue
+                    break
+                if len(numeric_tail) >= 4:
+                    reference = parts[0]
+                    description_parts = parts[1 : len(parts) - len(numeric_tail)]
+                    if description_parts:
+                        if len(numeric_tail) >= 5:
+                            quantity, price, discount, tax = numeric_tail[:4]
+                            amount = numeric_tail[4]
+                        else:
+                            quantity, price, tax, amount = numeric_tail[:4]
+                            discount = None
+                        add_candidate(reference, " ".join(description_parts), quantity, price, tax, discount, amount)
+                        if len(candidates) > limit:
+                            line_limit_reached = True
+                            break
+                        continue
             match = line_re.match(clean)
             if not match:
                 continue
             reference, description, quantity, price, tax = match.groups()
             add_candidate(reference, description, quantity, price, tax)
-            if len(candidates) >= limit:
+            if len(candidates) > limit:
+                line_limit_reached = True
                 break
         if not candidates:
             clean_lines = [re.sub(r"\s+", " ", raw_line).strip() for raw_line in text.splitlines()]
@@ -7134,24 +8064,802 @@ class FaroPhase1Service:
                 ):
                     add_candidate(reference, description, quantity, price, tax)
                     index += 5
+                    if len(candidates) > limit:
+                        line_limit_reached = True
+                        break
                     continue
                 index += 1
-        return {
+        if line_limit_reached:
+            candidates = candidates[:limit]
+        candidates = self._dedupe_purchase_entry_pdf_candidates(candidates)
+        totals = self._purchase_pdf_reconciliation(text, candidates)
+        total_mismatch = totals["reconciled"] is False
+        pages_complete = not bool(meta.get("extraction_incomplete"))
+        evidence = meta.get("evidence") if isinstance(meta.get("evidence"), dict) else {}
+        detail_signal_count = int(evidence.get("detail_signal_count") or 0) if evidence else 0
+        evidence_low_confidence = bool(evidence and candidates and detail_signal_count <= 0)
+        no_lines_detected = not bool(candidates)
+        missing_policy = self._purchase_entry_missing_article_policy(args.get("politica_articulo_no_encontrado"))
+        unresolved_lines = [
+            line for line in candidates
+            if isinstance(line, dict) and line.get("resuelto") is False and not line.get("articulo")
+        ]
+        unresolved_blocking = bool(unresolved_lines) and missing_policy == "detener"
+        validation = {
+            "line_limit_reached": line_limit_reached,
+            "pages_complete": pages_complete,
+            "total_reconciled": not total_mismatch,
+            "unresolved_lines": len(unresolved_lines),
+            "no_lines_detected": no_lines_detected,
+            "evidence_low_confidence": evidence_low_confidence,
+            "can_create_entry": (
+                not line_limit_reached
+                and pages_complete
+                and not total_mismatch
+                and not unresolved_blocking
+                and not no_lines_detected
+                and not evidence_low_confidence
+            ),
+        }
+        if line_limit_reached:
+            warnings.append("line_limit_reached")
+        if not pages_complete:
+            warnings.append("extraction_incomplete")
+        if total_mismatch:
+            warnings.append("total_mismatch")
+        if unresolved_blocking:
+            warnings.append("unresolved_article")
+        if no_lines_detected:
+            warnings.append("no_lines_detected")
+        if evidence_low_confidence:
+            warnings.append("evidence_low_confidence")
+        proposal = {
             "pdf": meta,
+            "hash_sha256": document_hash,
+            "version": 1,
             "texto_extraido_caracteres": len(text),
             "_texto_extraido_documento": text,
             "cabecera": cabecera,
             "lineas": candidates,
+            "totales": totals,
             "advertencias": warnings,
+            "validacion": validation,
             "validacion_fuentes": {
                 "cabecera_y_totales": "C:\\IA\\Faro\\FuentesFaro\\CABDOCM_UDM.pas",
                 "pantalla_entradas": "C:\\IA\\Faro\\FuentesFaro\\MNTDOCM_U.pas",
                 "detalle": "C:\\IA\\Faro\\FuentesFaro\\DETMOVM_UB.pas",
             },
         }
+        if args.get("persistir_propuesta"):
+            proposal["importacion"] = self._persist_purchase_entry_pdf_proposal(args, proposal)
+        return proposal
+
+    def _purchase_entry_pdf_review_incidents(self, proposal: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build user-facing reasons why a PDF proposal cannot be posted yet."""
+        validation = proposal.get("validacion") if isinstance(proposal.get("validacion"), dict) else {}
+        warnings = {str(value) for value in proposal.get("advertencias") or []}
+        incidents: list[dict[str, Any]] = []
+        header = proposal.get("cabecera") if isinstance(proposal.get("cabecera"), dict) else {}
+        missing_policy = self._purchase_entry_missing_article_policy(header.get("politica_articulo_no_encontrado"))
+        unresolved_lines = [
+            line for line in proposal.get("lineas") or []
+            if isinstance(line, dict) and line.get("resuelto") is False and not line.get("articulo")
+        ]
+        if (unresolved_lines or "unresolved_article" in warnings) and missing_policy == "detener":
+            references = [
+                str(line.get("referencia_proveedor") or line.get("descripcion") or "?").strip()
+                for line in unresolved_lines
+            ]
+            descriptions = [
+                str(line.get("descripcion") or "").strip()
+                for line in unresolved_lines
+                if str(line.get("descripcion") or "").strip()
+            ]
+            message = "Articulos no encontrados en la ficha de compra del proveedor."
+            if references:
+                message += " Referencias: " + ", ".join(references[:10])
+                if len(references) > 10:
+                    message += f" (+{len(references) - 10} mas)"
+            message += " Revisa/asigna articulo antes de confirmar la entrada."
+            incidents.append({
+                "codigo": "unresolved_article",
+                "mensaje": message,
+                "referencias": references,
+                "descripciones": descriptions,
+            })
+        if validation.get("total_reconciled") is False or "total_mismatch" in warnings:
+            totals = proposal.get("totales") if isinstance(proposal.get("totales"), dict) else {}
+            incidents.append({
+                "codigo": "total_mismatch",
+                "mensaje": (
+                    "El total calculado no cuadra con el total del documento "
+                    f"(documento={totals.get('source_gross') or '?'}; "
+                    f"calculado={totals.get('computed_gross') or '?'}; "
+                    f"diferencia={totals.get('difference') or '?'})."
+                ),
+            })
+        if validation.get("line_limit_reached") or "line_limit_reached" in warnings:
+            incidents.append({
+                "codigo": "line_limit_reached",
+                "mensaje": "Se alcanzo el limite de lineas extraidas; revisa que no falten lineas del PDF.",
+            })
+        if validation.get("pages_complete") is False or "extraction_incomplete" in warnings:
+            incidents.append({
+                "codigo": "extraction_incomplete",
+                "mensaje": "La extraccion del PDF no cubrio todas las paginas; revisa el documento completo.",
+            })
+        if validation.get("no_lines_detected") or "no_lines_detected" in warnings:
+            incidents.append({
+                "codigo": "no_lines_detected",
+                "mensaje": "No se han detectado lineas de detalle suficientes para crear la entrada.",
+            })
+        if validation.get("evidence_low_confidence") or "evidence_low_confidence" in warnings:
+            incidents.append({
+                "codigo": "evidence_low_confidence",
+                "mensaje": "La extraccion es de baja confianza; revisa proveedor, documento, cantidades y precios.",
+            })
+        return incidents
+
+    def _purchase_entry_document_hash(self, args: dict[str, Any]) -> str:
+        try:
+            document_bytes, _ = self._purchase_entry_pdf_bytes(args)
+        except FaroError:
+            return ""
+        return hashlib.sha256(document_bytes).hexdigest()
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {str(key): FaroPhase1Service._json_safe(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [FaroPhase1Service._json_safe(item) for item in value]
+        if isinstance(value, tuple):
+            return [FaroPhase1Service._json_safe(item) for item in value]
+        return value
+
+    def _persist_purchase_entry_pdf_proposal(self, args: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
+        proposal_id = str(args.get("propuesta_id") or self._gestion_documental_doc_id())
+        header = proposal.get("cabecera") or {}
+        now = datetime.now()
+        public_proposal = {key: value for key, value in proposal.items() if not str(key).startswith("_")}
+        proposal_hash = str(proposal.get("hash_sha256") or "")
+        if not proposal_hash:
+            if args.get("persistir_propuesta") == "obligatorio":
+                raise FaroError("No se puede persistir una propuesta sin hash del archivo original.")
+            return {
+                "persistida": False,
+                "motivo": "sin_hash_archivo",
+                "tabla": "GDC_IMPORTACION",
+                "id": proposal_id,
+            }
+        existing = normalize(self.db.fetch_one(
+            "SELECT FIRST 1 GDI_ID, GDI_VERSION FROM GDC_IMPORTACION "
+            "WHERE GDI_NUMEMP=? AND GDI_HASH=? AND GDI_ESTADO IN ('PROPUESTA', 'REVISADA') "
+            "ORDER BY GDI_FECMOD DESC",
+            (self.settings.empresa, proposal_hash),
+        ) or {})
+        if existing.get("GDI_ID"):
+            proposal_id = str(existing.get("GDI_ID") or proposal_id)
+            public_proposal["version"] = int(existing.get("GDI_VERSION") or 1) + 1
+        proposal_json = json.dumps(self._json_safe(public_proposal), ensure_ascii=False, sort_keys=True)
+        values = {
+            "GDI_ID": proposal_id,
+            "GDI_NUMEMP": self.settings.empresa,
+            "GDI_CENTRO": int(header.get("centro") or self.settings.centro),
+            "GDI_ESTADO": "PROPUESTA",
+            "GDI_VERSION": int(public_proposal.get("version") or proposal.get("version") or 1),
+            "GDI_HASH": proposal_hash,
+            "GDI_ORIGEN": self._clean_document_text((proposal.get("pdf") or {}).get("origen"), 255),
+            "GDI_PROVEEDOR": int(header.get("proveedor") or 0),
+            "GDI_FACTURA": self._clean_document_text(header.get("factura"), 30),
+            "GDI_ALBARAN": self._clean_document_text(header.get("albaran"), 30),
+            "GDI_PROPUESTA": proposal_json,
+            "GDI_FEALTA": now,
+            "GDI_USUALTA": self.settings.usuario,
+            "GDI_FECMOD": now,
+            "GDI_USUMOD": self.settings.usuario,
+        }
+        if existing.get("GDI_ID"):
+            try:
+                self.db.execute(
+                    "UPDATE GDC_IMPORTACION SET GDI_ESTADO=?, GDI_VERSION=?, GDI_CENTRO=?, "
+                    "GDI_ORIGEN=?, GDI_PROVEEDOR=?, GDI_FACTURA=?, GDI_ALBARAN=?, GDI_PROPUESTA=?, "
+                    "GDI_FECMOD=?, GDI_USUMOD=? "
+                    "WHERE GDI_NUMEMP=? AND GDI_ID=? AND GDI_HASH=? AND GDI_ESTADO IN ('PROPUESTA', 'REVISADA')",
+                    (
+                        values["GDI_ESTADO"],
+                        values["GDI_VERSION"],
+                        values["GDI_CENTRO"],
+                        values["GDI_ORIGEN"],
+                        values["GDI_PROVEEDOR"],
+                        values["GDI_FACTURA"],
+                        values["GDI_ALBARAN"],
+                        values["GDI_PROPUESTA"],
+                        values["GDI_FECMOD"],
+                        values["GDI_USUMOD"],
+                        self.settings.empresa,
+                        proposal_id,
+                        proposal_hash,
+                    ),
+                )
+                self.db.commit()
+            except Exception as exc:
+                self.db.rollback()
+                if args.get("persistir_propuesta") == "obligatorio":
+                    raise FaroError("No se pudo actualizar la propuesta de importacion documental.") from exc
+                return {
+                    "persistida": False,
+                    "motivo": str(exc),
+                    "tabla": "GDC_IMPORTACION",
+                    "id": proposal_id,
+                }
+            return {
+                "persistida": True,
+                "tabla": "GDC_IMPORTACION",
+                "id": proposal_id,
+                "version": values["GDI_VERSION"],
+                "estado": values["GDI_ESTADO"],
+                "hash_sha256": values["GDI_HASH"],
+                "actualizada": True,
+            }
+        columns = list(values)
+        placeholders = ", ".join("?" for _ in columns)
+        try:
+            self.db.execute(
+                f"INSERT INTO GDC_IMPORTACION ({', '.join(columns)}) VALUES ({placeholders})",
+                tuple(values[column] for column in columns),
+            )
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            if args.get("persistir_propuesta") == "obligatorio":
+                raise FaroError("No se pudo persistir la propuesta de importacion documental.") from exc
+            return {
+                "persistida": False,
+                "motivo": str(exc),
+                "tabla": "GDC_IMPORTACION",
+                "id": proposal_id,
+            }
+        return {
+            "persistida": True,
+            "tabla": "GDC_IMPORTACION",
+            "id": proposal_id,
+            "version": values["GDI_VERSION"],
+            "estado": values["GDI_ESTADO"],
+            "hash_sha256": values["GDI_HASH"],
+        }
+
+    def _purchase_entry_saved_proposal_reconciliation(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        lines = proposal.get("lineas") if isinstance(proposal.get("lineas"), list) else []
+        previous_totals = proposal.get("totales") if isinstance(proposal.get("totales"), dict) else {}
+        computed_net = sum((self._purchase_pdf_line_net_amount(line) for line in lines if isinstance(line, dict)), Decimal("0"))
+        computed_tax = sum(
+            (
+                self._purchase_pdf_line_net_amount(line)
+                * self._parse_pdf_number(str(line.get("iva") or "21"))
+                / Decimal("100")
+                for line in lines
+                if isinstance(line, dict)
+            ),
+            Decimal("0"),
+        )
+        computed_gross = computed_net + computed_tax
+        expected = previous_totals.get("source_gross")
+        expected_decimal = self._parse_pdf_number(str(expected)) if expected not in (None, "") else None
+        tolerance = Decimal("0.01")
+        difference = self._round_purchase_pdf_amount(computed_gross - expected_decimal) if expected_decimal is not None else None
+        reconciled = True if expected_decimal is None else abs(difference or Decimal("0")) <= tolerance
+        return {
+            **previous_totals,
+            "computed_net": self._format_purchase_pdf_amount(computed_net),
+            "computed_tax": self._format_purchase_pdf_amount(computed_tax),
+            "computed_gross": self._format_purchase_pdf_amount(computed_gross),
+            "difference": self._format_purchase_pdf_amount(difference) if difference is not None else None,
+            "tolerance": str(tolerance),
+            "reconciled": reconciled,
+        }
+
+    @staticmethod
+    def _proposal_blob_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if hasattr(value, "read"):
+            data = value.read()
+            return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+        return str(value)
+
+    @classmethod
+    def _proposal_json_loads(cls, value: Any) -> dict[str, Any]:
+        text = cls._proposal_blob_text(value).strip()
+        if not text:
+            return {}
+        decoder = json.JSONDecoder()
+        parsed, _ = decoder.raw_decode(text)
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _load_purchase_entry_importation(self, proposal_id: str) -> dict[str, Any]:
+        row = self.db.fetch_one(
+            "SELECT * FROM GDC_IMPORTACION WHERE GDI_NUMEMP=? AND GDI_ID=?",
+            (self.settings.empresa, proposal_id),
+        )
+        if not row:
+            raise FaroError(f"Propuesta de importacion no encontrada: {proposal_id}")
+        return normalize(row)
+
+    def list_purchase_entry_importations(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        args = dict(args or {})
+        estados_raw = args.get("estados") or ["PROPUESTA", "REVISADA"]
+        if not isinstance(estados_raw, list):
+            estados_raw = [estados_raw]
+        estados = [str(value or "").strip().upper() for value in estados_raw if str(value or "").strip()]
+        if not estados:
+            estados = ["PROPUESTA", "REVISADA"]
+        limit = max(1, min(int(args.get("limite", 50) or 50), 200))
+        offset = max(0, int(args.get("offset", 0) or 0))
+        busqueda = str(args.get("busqueda") or args.get("search") or "").strip()
+        placeholders = ", ".join("?" for _ in estados)
+        where_parts = [
+            "GDI_NUMEMP=?",
+            "GDI_ESTADO IN (" + placeholders + ")",
+        ]
+        params: list[Any] = [self.settings.empresa, *estados]
+        if busqueda:
+            like = "%" + busqueda.upper() + "%"
+            where_parts.append(
+                "(UPPER(COALESCE(GDI_ID, '')) LIKE ? OR "
+                "UPPER(COALESCE(GDI_ORIGEN, '')) LIKE ? OR "
+                "UPPER(COALESCE(GDI_FACTURA, '')) LIKE ? OR "
+                "UPPER(COALESCE(GDI_ALBARAN, '')) LIKE ?)"
+            )
+            params.extend([like, like, like, like])
+        where_sql = " WHERE " + " AND ".join(where_parts)
+        total_row = normalize(self.db.fetch_one("SELECT COUNT(*) AS TOTAL FROM GDC_IMPORTACION" + where_sql, tuple(params)) or {})
+        total = int(total_row["TOTAL"]) if "TOTAL" in total_row else None
+        rows = self.db.fetch_all(
+            "SELECT FIRST "
+            + str(limit)
+            + " SKIP "
+            + str(offset)
+            + " GDI_ID, GDI_NUMEMP, GDI_CENTRO, GDI_ESTADO, GDI_VERSION, GDI_HASH, GDI_ORIGEN, "
+            "GDI_PROVEEDOR, GDI_FACTURA, GDI_ALBARAN, GDI_PROPUESTA, GDI_ENT_CENTRO, GDI_ENT_EJERCI, "
+            "GDI_ENT_SERIE, GDI_ENT_NUMDOC, GDI_FEALTA, GDI_FECMOD "
+            "FROM GDC_IMPORTACION"
+            + where_sql
+            + " ORDER BY GDI_FECMOD DESC",
+            tuple(params),
+        )
+        items: list[dict[str, Any]] = []
+        seen_documents: set[str] = set()
+        for raw_row in rows:
+            row = normalize(raw_row)
+            proposal: dict[str, Any] = {}
+            try:
+                proposal = self._proposal_json_loads(row.get("GDI_PROPUESTA"))
+            except Exception:
+                proposal = {}
+            cabecera = proposal.get("cabecera") if isinstance(proposal.get("cabecera"), dict) else {}
+            item = {
+                "pdf": row.get("GDI_ORIGEN") or (proposal.get("pdf") or {}).get("origen") or "",
+                "pdf_meta": proposal.get("pdf") if isinstance(proposal.get("pdf"), dict) else {},
+                "estado": str(row.get("GDI_ESTADO") or "").lower(),
+                "cabecera": cabecera,
+                "lineas": proposal.get("lineas") if isinstance(proposal.get("lineas"), list) else [],
+                "validacion": proposal.get("validacion") if isinstance(proposal.get("validacion"), dict) else {},
+                "totales": proposal.get("totales") if isinstance(proposal.get("totales"), dict) else {},
+                "advertencias": proposal.get("advertencias") if isinstance(proposal.get("advertencias"), list) else [],
+                "importacion": {
+                    "id": row.get("GDI_ID"),
+                    "estado": row.get("GDI_ESTADO"),
+                    "version": int(row.get("GDI_VERSION") or 0),
+                    "hash_sha256": row.get("GDI_HASH"),
+                    "persistida": True,
+                },
+                "fecha_modificacion": row.get("GDI_FECMOD"),
+            }
+            document_key = str(row.get("GDI_HASH") or "").strip().lower()
+            if not document_key:
+                document_key = "|".join(
+                    str(value or "").strip().lower()
+                    for value in (item["pdf"], cabecera.get("albaran"), cabecera.get("factura"))
+                )
+            if document_key in seen_documents:
+                continue
+            seen_documents.add(document_key)
+            items.append(item)
+        return {
+            "ok": True,
+            "total": len(items) if offset == 0 and not busqueda else (total if total is not None else len(items)),
+            "offset": offset,
+            "limite": limit,
+            "busqueda": busqueda,
+            "estados": estados,
+            "documentos": items,
+        }
+
+    def confirm_purchase_entry_importation(self, args: dict[str, Any]) -> dict[str, Any]:
+        proposal_id = str(args.get("propuesta_id") or args.get("id") or "").strip()
+        if not proposal_id:
+            raise FaroError("propuesta_id es obligatorio")
+        row = self._load_purchase_entry_importation(proposal_id)
+        estado = str(row.get("GDI_ESTADO") or "").strip().upper()
+        if estado == "CONFIRMADA":
+            result = {
+                "ok": True,
+                "idempotente": True,
+                "importacion": {
+                    "id": proposal_id,
+                    "estado": estado,
+                    "version": int(row.get("GDI_VERSION") or 0),
+                    "hash_sha256": str(row.get("GDI_HASH") or ""),
+                },
+                "documento": {
+                    "centro": int(row.get("GDI_ENT_CENTRO") or 0),
+                    "ejercicio": int(row.get("GDI_ENT_EJERCI") or 0),
+                    "serie": str(row.get("GDI_ENT_SERIE") or ""),
+                    "numero": int(row.get("GDI_ENT_NUMDOC") or 0),
+                },
+            }
+            cleanup_source = str(row.get("GDI_ORIGEN") or "").strip()
+            if cleanup_source:
+                source_path = Path(cleanup_source).expanduser()
+                try:
+                    if source_path.exists() and source_path.parent.resolve() == self._gestion_documental_pending_dir().resolve():
+                        processed_args = {"nombre_fichero": source_path.name}
+                        if source_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+                            processed_args["ruta_imagen"] = str(source_path)
+                        else:
+                            processed_args["ruta_pdf"] = str(source_path)
+                        result["procesados"] = self._copy_pdf_source_to(
+                            processed_args,
+                            self._gestion_documental_processed_dir(),
+                        )
+                        result["pendiente_borrado"] = self._delete_pending_document(source_path)
+                except Exception as cleanup_error:
+                    result["pendiente_borrado"] = {
+                        "ruta": str(source_path),
+                        "borrado": False,
+                        "error": str(cleanup_error),
+                    }
+            return result
+        if estado not in {"PROPUESTA", "REVISADA"}:
+            raise FaroError(f"La propuesta {proposal_id} no se puede confirmar en estado {estado or 'sin_estado'}.")
+        expected_version = args.get("version")
+        if expected_version not in (None, "") and int(expected_version) != int(row.get("GDI_VERSION") or 0):
+            raise FaroError("La version de la propuesta no coincide; vuelve a revisar el documento.")
+        expected_hash = str(args.get("hash_sha256") or "").strip()
+        stored_hash = str(row.get("GDI_HASH") or "").strip()
+        if expected_hash and expected_hash != stored_hash:
+            raise FaroError("El hash del archivo no coincide con la propuesta guardada.")
+        if not self._proposal_blob_text(row.get("GDI_PROPUESTA")):
+            raise FaroError("La propuesta guardada no contiene JSON.")
+        try:
+            proposal = self._proposal_json_loads(row.get("GDI_PROPUESTA"))
+        except json.JSONDecodeError as exc:
+            raise FaroError("La propuesta guardada no contiene JSON valido.") from exc
+        header = dict(proposal.get("cabecera") or {})
+        if isinstance(args.get("cabecera"), dict):
+            header.update(args["cabecera"])
+        lines = args.get("lineas") if isinstance(args.get("lineas"), list) and args.get("lineas") else proposal.get("lineas")
+        if not isinstance(lines, list) or not lines:
+            raise FaroError("La propuesta guardada no contiene lineas confirmables.")
+        missing_policy = self._purchase_entry_missing_article_policy(
+            header.get("politica_articulo_no_encontrado", args.get("politica_articulo_no_encontrado"))
+        )
+        header["politica_articulo_no_encontrado"] = missing_policy
+        validation = proposal.get("validacion") if isinstance(proposal.get("validacion"), dict) else {}
+        unresolved_lines = [
+            line for line in lines
+            if isinstance(line, dict)
+            and not str(line.get("articulo") or "").strip()
+        ]
+        only_unresolved_blocks = (
+            bool(unresolved_lines)
+            and missing_policy == "fantasma"
+            and not validation.get("line_limit_reached")
+            and validation.get("pages_complete", True) is not False
+            and validation.get("total_reconciled", True) is not False
+            and not validation.get("no_lines_detected")
+            and not validation.get("evidence_low_confidence")
+        )
+        if validation.get("can_create_entry") is False and not only_unresolved_blocks:
+            raise FaroError("La propuesta guardada requiere revision antes de confirmar.")
+        self._require_purchase_entry_provider(header)
+        existing = self._purchase_entry_existing_for_pdf_header(header)
+        if existing:
+            raise FaroError(f"{self._purchase_entry_existing_message(existing)} No se confirma otra entrada.")
+        copied_paths: list[tuple[Path, bool]] = []
+        try:
+            result = self._create_purchase_entry_core(header, lines, manage_transaction=False)
+            source_args: dict[str, Any] = {}
+            for key in ("ruta_pdf", "ruta_imagen", "content_base64", "content_base64_imagen", "nombre_fichero"):
+                if args.get(key):
+                    source_args[key] = args[key]
+            if not any(source_args.get(key) for key in ("ruta_pdf", "ruta_imagen", "content_base64", "content_base64_imagen")):
+                origin = str(row.get("GDI_ORIGEN") or (proposal.get("pdf") or {}).get("origen") or "").strip()
+                if origin and Path(origin).expanduser().exists():
+                    suffix = Path(origin).suffix.lower()
+                    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+                        source_args["ruta_imagen"] = origin
+                    else:
+                        source_args["ruta_pdf"] = origin
+            if source_args and not source_args.get("nombre_fichero"):
+                source = str(source_args.get("ruta_pdf") or source_args.get("ruta_imagen") or row.get("GDI_ORIGEN") or "documento.pdf")
+                source_args["nombre_fichero"] = Path(source).name
+            if source_args:
+                result["_texto_extraido_documento"] = proposal.get("_texto_extraido_documento", "")
+                result["gestion_documental"] = self._save_purchase_entry_pdf_document(
+                    source_args, result, manage_transaction=False
+                )
+                gd_path = result.get("gestion_documental", {}).get("ruta")
+                if gd_path:
+                    copied_paths.append((Path(str(gd_path)), bool(result.get("gestion_documental", {}).get("existente"))))
+                result["documentos_entradas"] = self._copy_purchase_entry_pdf_to_documents_entries(source_args, result)
+                entries_path = result.get("documentos_entradas", {}).get("ruta")
+                if entries_path:
+                    copied_paths.append((Path(str(entries_path)), bool(result.get("documentos_entradas", {}).get("existente"))))
+                result.pop("_texto_extraido_documento", None)
+            else:
+                result["gestion_documental"] = {
+                    "archivado": False,
+                    "motivo": "sin_fuente_documental_disponible",
+                }
+            document = result.get("documento") or {}
+            self.db.execute(
+                "UPDATE GDC_IMPORTACION SET GDI_ESTADO=?, GDI_ENT_CENTRO=?, GDI_ENT_EJERCI=?, "
+                "GDI_ENT_SERIE=?, GDI_ENT_NUMDOC=?, GDI_FECMOD=?, GDI_USUMOD=? "
+                "WHERE GDI_NUMEMP=? AND GDI_ID=? AND GDI_VERSION=? AND GDI_HASH=?",
+                (
+                    "CONFIRMADA",
+                    int(document.get("centro") or 0),
+                    int(document.get("ejercicio") or 0),
+                    str(document.get("serie") or ""),
+                    int(document.get("numero") or 0),
+                    datetime.now(),
+                    self.settings.usuario,
+                    self.settings.empresa,
+                    proposal_id,
+                    int(row.get("GDI_VERSION") or 0),
+                    stored_hash,
+                ),
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            for path, existed in copied_paths:
+                if existed:
+                    continue
+                try:
+                    if path.exists():
+                        path.unlink()
+                except Exception:
+                    pass
+            raise
+        result["importacion"] = {
+            "id": proposal_id,
+            "estado": "CONFIRMADA",
+            "version": int(row.get("GDI_VERSION") or 0),
+            "hash_sha256": stored_hash,
+        }
+        return result
+
+    def retry_purchase_entry_importation_documentation(self, args: dict[str, Any]) -> dict[str, Any]:
+        proposal_id = str(args.get("propuesta_id") or args.get("id") or "").strip()
+        if not proposal_id:
+            raise FaroError("propuesta_id es obligatorio.")
+        row = self._load_purchase_entry_importation(proposal_id)
+        estado = str(row.get("GDI_ESTADO") or "").strip().upper()
+        if estado != "CONFIRMADA":
+            raise FaroError("Solo se puede reintentar el archivo de una propuesta CONFIRMADA.")
+        documento = {
+            "centro": int(row.get("GDI_ENT_CENTRO") or 0),
+            "ejercicio": int(row.get("GDI_ENT_EJERCI") or 0),
+            "serie": str(row.get("GDI_ENT_SERIE") or ""),
+            "numero": int(row.get("GDI_ENT_NUMDOC") or 0),
+        }
+        if not documento["centro"] or not documento["ejercicio"] or not documento["serie"] or not documento["numero"]:
+            raise FaroError("La propuesta confirmada no conserva la clave de entrada de almacen.")
+        try:
+            proposal = self._proposal_json_loads(row.get("GDI_PROPUESTA"))
+        except json.JSONDecodeError as exc:
+            raise FaroError("La propuesta guardada no contiene JSON valido.") from exc
+        source_args: dict[str, Any] = {}
+        for key in ("ruta_pdf", "ruta_imagen", "content_base64", "content_base64_imagen", "nombre_fichero"):
+            if args.get(key):
+                source_args[key] = args[key]
+        if not any(source_args.get(key) for key in ("ruta_pdf", "ruta_imagen", "content_base64", "content_base64_imagen")):
+            origin = str(row.get("GDI_ORIGEN") or (proposal.get("pdf") or {}).get("origen") or "").strip()
+            if not origin:
+                raise FaroError("No hay ruta de origen guardada; informa ruta_pdf, ruta_imagen o content_base64.")
+            suffix = Path(origin).suffix.lower()
+            if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+                source_args["ruta_imagen"] = origin
+            else:
+                source_args["ruta_pdf"] = origin
+        if not source_args.get("nombre_fichero"):
+            source = str(source_args.get("ruta_pdf") or source_args.get("ruta_imagen") or row.get("GDI_ORIGEN") or "documento.pdf")
+            source_args["nombre_fichero"] = Path(source).name
+        entry_result = {
+            "documento": documento,
+            "_texto_extraido_documento": proposal.get("_texto_extraido_documento", ""),
+            "totales": proposal.get("totales", {}),
+        }
+        gestion_documental = self._save_purchase_entry_pdf_document(source_args, entry_result)
+        documentos_entradas = None
+        if args.get("copiar_documentos_entradas", True):
+            documentos_entradas = self._copy_purchase_entry_pdf_to_documents_entries(source_args, entry_result)
+        return {
+            "ok": True,
+            "documento": documento,
+            "gestion_documental": gestion_documental,
+            "documentos_entradas": documentos_entradas,
+            "importacion": {
+                "id": proposal_id,
+                "estado": estado,
+                "version": int(row.get("GDI_VERSION") or 0),
+                "hash_sha256": row.get("GDI_HASH"),
+            },
+        }
+
+    def save_purchase_entry_importation_revision(self, args: dict[str, Any]) -> dict[str, Any]:
+        proposal_id = str(args.get("propuesta_id") or args.get("id") or "").strip()
+        if not proposal_id:
+            raise FaroError("propuesta_id es obligatorio")
+        row = self._load_purchase_entry_importation(proposal_id)
+        estado = str(row.get("GDI_ESTADO") or "").strip().upper()
+        if estado == "CONFIRMADA":
+            raise FaroError("Una propuesta confirmada no se puede modificar.")
+        expected_version = int(args.get("version") or 0)
+        stored_version = int(row.get("GDI_VERSION") or 0)
+        if expected_version != stored_version:
+            raise FaroError("La version de la propuesta no coincide; recarga antes de guardar.")
+        expected_hash = str(args.get("hash_sha256") or "").strip()
+        stored_hash = str(row.get("GDI_HASH") or "").strip()
+        if expected_hash and expected_hash != stored_hash:
+            raise FaroError("El hash del archivo no coincide con la propuesta guardada.")
+        try:
+            proposal = self._proposal_json_loads(row.get("GDI_PROPUESTA"))
+        except json.JSONDecodeError as exc:
+            raise FaroError("La propuesta guardada no contiene JSON valido.") from exc
+        if isinstance(args.get("cabecera"), dict):
+            proposal["cabecera"] = {**(proposal.get("cabecera") or {}), **args["cabecera"]}
+        if isinstance(args.get("lineas"), list) and args.get("lineas"):
+            proposal["lineas"] = args["lineas"]
+        totals = self._purchase_entry_saved_proposal_reconciliation(proposal)
+        proposal["totales"] = totals
+        validation = proposal.get("validacion") if isinstance(proposal.get("validacion"), dict) else {}
+        lines = proposal.get("lineas") if isinstance(proposal.get("lineas"), list) else []
+        unresolved_lines = [
+            line for line in lines
+            if isinstance(line, dict)
+            and not str(line.get("articulo") or "").strip()
+        ]
+        validation["unresolved_lines"] = len(unresolved_lines)
+        validation["no_lines_detected"] = not bool(lines)
+        validation["total_reconciled"] = bool(totals.get("reconciled"))
+        header = proposal.get("cabecera") if isinstance(proposal.get("cabecera"), dict) else {}
+        missing_policy = self._purchase_entry_missing_article_policy(header.get("politica_articulo_no_encontrado"))
+        validation["ghost_lines_allowed"] = missing_policy == "fantasma"
+        validation["can_create_entry"] = (
+            not validation.get("line_limit_reached")
+            and validation.get("pages_complete", True) is not False
+            and validation["total_reconciled"]
+            and (not unresolved_lines or missing_policy == "fantasma")
+        )
+        proposal["validacion"] = validation
+        warnings = [str(value) for value in proposal.get("advertencias") or []]
+        has_provider = bool(int(header.get("proveedor") or 0))
+        warnings = [
+            value for value in warnings
+            if value not in {"total_mismatch", "unresolved_article", "no_lines_detected"}
+            and not (has_provider and value.startswith("No se pudo resolver proveedor por "))
+        ]
+        if validation["no_lines_detected"]:
+            warnings.append("no_lines_detected")
+        if validation["total_reconciled"] is False:
+            warnings.append("total_mismatch")
+        if unresolved_lines and missing_policy == "detener":
+            warnings.append("unresolved_article")
+        proposal["advertencias"] = warnings
+        new_version = stored_version + 1
+        proposal["version"] = new_version
+        proposal_json = json.dumps(self._json_safe(proposal), ensure_ascii=False, sort_keys=True)
+        self.db.execute(
+            "UPDATE GDC_IMPORTACION SET GDI_ESTADO=?, GDI_VERSION=?, GDI_PROVEEDOR=?, GDI_FACTURA=?, "
+            "GDI_ALBARAN=?, GDI_PROPUESTA=?, GDI_FECMOD=?, GDI_USUMOD=? "
+            "WHERE GDI_NUMEMP=? AND GDI_ID=? AND GDI_VERSION=? AND GDI_HASH=?",
+            (
+                "REVISADA",
+                new_version,
+                int(header.get("proveedor") or 0),
+                self._clean_document_text(header.get("factura"), 30),
+                self._clean_document_text(header.get("albaran"), 30),
+                proposal_json,
+                datetime.now(),
+                self.settings.usuario,
+                self.settings.empresa,
+                proposal_id,
+                stored_version,
+                stored_hash,
+            ),
+        )
+        self.db.commit()
+        return {
+            "ok": True,
+            "importacion": {
+                "id": proposal_id,
+                "estado": "REVISADA",
+                "version": new_version,
+                "hash_sha256": stored_hash,
+            },
+            "validacion": validation,
+            "totales": totals,
+        }
+
+    def delete_purchase_entry_importation_revision(self, args: dict[str, Any]) -> dict[str, Any]:
+        proposal_id = str(args.get("propuesta_id") or args.get("id") or "").strip()
+        if not proposal_id:
+            raise FaroError("propuesta_id es obligatorio")
+        row = self._load_purchase_entry_importation(proposal_id)
+        estado = str(row.get("GDI_ESTADO") or "").strip().upper()
+        if estado == "CONFIRMADA":
+            raise FaroError("Una propuesta confirmada no se puede borrar desde revisiones.")
+        if estado not in {"PROPUESTA", "REVISADA"}:
+            raise FaroError(f"La propuesta {proposal_id} no se puede borrar en estado {estado or 'sin_estado'}.")
+        expected_version = int(args.get("version") or 0)
+        stored_version = int(row.get("GDI_VERSION") or 0)
+        if expected_version != stored_version:
+            raise FaroError("La version de la propuesta no coincide; recarga antes de borrar.")
+        expected_hash = str(args.get("hash_sha256") or "").strip()
+        stored_hash = str(row.get("GDI_HASH") or "").strip()
+        if expected_hash and expected_hash != stored_hash:
+            raise FaroError("El hash del archivo no coincide con la propuesta guardada.")
+        try:
+            self.db.execute(
+                "DELETE FROM GDC_IMPORTACION "
+                "WHERE GDI_NUMEMP=? AND GDI_ID=? AND GDI_VERSION=? AND GDI_HASH=? "
+                "AND GDI_ESTADO IN ('PROPUESTA', 'REVISADA')",
+                (self.settings.empresa, proposal_id, stored_version, stored_hash),
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        remaining = self.db.fetch_one(
+            "SELECT GDI_ID FROM GDC_IMPORTACION WHERE GDI_NUMEMP=? AND GDI_ID=?",
+            (self.settings.empresa, proposal_id),
+        )
+        if remaining:
+            raise FaroError("No se pudo borrar la propuesta; recarga y vuelve a intentarlo.")
+        return {
+            "ok": True,
+            "borrada": True,
+            "importacion": {
+                "id": proposal_id,
+                "estado": estado,
+                "version": stored_version,
+                "hash_sha256": stored_hash,
+            },
+        }
 
     def create_purchase_entry_from_pdf(self, args: dict[str, Any]) -> dict[str, Any]:
         proposal = self.purchase_entry_pdf_proposal(args)
+        validation = proposal.get("validacion") if isinstance(proposal.get("validacion"), dict) else {}
+        if validation.get("pages_complete") is False:
+            raise FaroError("Documento pendiente de revision: extraccion incompleta.")
+        if validation.get("line_limit_reached"):
+            raise FaroError("La extraccion alcanzo el limite de lineas; documento pendiente de revision.")
+        if validation.get("no_lines_detected"):
+            raise FaroError("Documento pendiente de revision: no se detectaron lineas de entrada.")
+        if validation.get("evidence_low_confidence"):
+            raise FaroError("Documento pendiente de revision: evidencia insuficiente para las lineas detectadas.")
+        if validation.get("total_reconciled") is False:
+            raise FaroError("Documento pendiente de revision: descuadre entre lineas detectadas y total del documento.")
         header = dict(proposal["cabecera"])
         if isinstance(args.get("cabecera"), dict):
             header.update(args["cabecera"])
@@ -7177,16 +8885,42 @@ class FaroPhase1Service:
                 "Articulo no encontrado en ficha de compra del proveedor; documento pendiente de procesar. "
                 f"Referencias: {refs}"
             )
-        result = self.create_purchase_entry(header, lines)
-        result["pdf"] = proposal["pdf"]
-        result["lineas_pdf_detectadas"] = len(proposal["lineas"])
-        result["lineas_documento_detectadas"] = len(proposal["lineas"])
-        result["advertencias_pdf"] = proposal["advertencias"]
-        result["validacion_fuentes"] = proposal["validacion_fuentes"]
-        result["_texto_extraido_documento"] = proposal.get("_texto_extraido_documento", "")
-        result["gestion_documental"] = self._save_purchase_entry_pdf_document(args, result)
+        existing = self._purchase_entry_existing_for_pdf_header(header)
+        if existing:
+            raise FaroError(f"{self._purchase_entry_existing_message(existing)} No se crea otra entrada.")
+        result: dict[str, Any] = {}
+        copied_paths: list[tuple[Path, bool]] = []
+        try:
+            result = self._create_purchase_entry_core(header, lines, manage_transaction=False)
+            result["pdf"] = proposal["pdf"]
+            result["lineas_pdf_detectadas"] = len(proposal["lineas"])
+            result["lineas_documento_detectadas"] = len(proposal["lineas"])
+            result["advertencias_pdf"] = proposal["advertencias"]
+            result["validacion_fuentes"] = proposal["validacion_fuentes"]
+            result["_texto_extraido_documento"] = proposal.get("_texto_extraido_documento", "")
+            result["gestion_documental"] = self._save_purchase_entry_pdf_document(
+                args, result, manage_transaction=False
+            )
+            gd_path = result.get("gestion_documental", {}).get("ruta")
+            if gd_path:
+                copied_paths.append((Path(str(gd_path)), bool(result.get("gestion_documental", {}).get("existente"))))
+            result["documentos_entradas"] = self._copy_purchase_entry_pdf_to_documents_entries(args, result)
+            entries_path = result.get("documentos_entradas", {}).get("ruta")
+            if entries_path:
+                copied_paths.append((Path(str(entries_path)), bool(result.get("documentos_entradas", {}).get("existente"))))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            for path, existed in copied_paths:
+                if existed:
+                    continue
+                try:
+                    if path.exists():
+                        path.unlink()
+                except Exception:
+                    pass
+            raise
         result.pop("_texto_extraido_documento", None)
-        result["documentos_entradas"] = self._copy_purchase_entry_pdf_to_documents_entries(args, result)
         return result
 
     def _gestion_documental_root(self) -> Path:
@@ -7228,12 +8962,44 @@ class FaroPhase1Service:
         )
         return normalize(row) if row else {}
 
-    def _save_purchase_entry_pdf_document(self, args: dict[str, Any], entry_result: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _purchase_entry_idkronos(documento: dict[str, Any]) -> str:
+        return (
+            f"CABDOCM:{documento.get('centro')}-"
+            f"{documento.get('ejercicio')}-{documento.get('serie')}-{documento.get('numero')}"
+        )
+
+    def _document_management_existing_for_entry(self, documento: dict[str, Any]) -> dict[str, Any] | None:
+        idkronos = self._clean_document_text(self._purchase_entry_idkronos(documento), 50)
+        if not idkronos:
+            return None
+        row = self.db.fetch_one(
+            "SELECT FIRST 1 DOC_ID, DOC_FICHERO, DOC_TIPO, DOC_SUBTIPO, DOC_IDKRONOS "
+            "FROM DOCUMENTO WHERE DOC_NUMEMP=? AND DOC_IDKRONOS=? ORDER BY DOC_FECMOD DESC",
+            (self.settings.empresa, idkronos),
+        )
+        return normalize(row) if row else None
+
+    def _save_purchase_entry_pdf_document(
+        self, args: dict[str, Any], entry_result: dict[str, Any], *, manage_transaction: bool = True
+    ) -> dict[str, Any]:
         document_bytes, source = self._purchase_entry_pdf_bytes(args)
         document_kind, document_suffix = self._purchase_entry_document_kind(document_bytes, source)
 
         documento = entry_result.get("documento") or {}
         header = self._cabdocm_for_document(documento)
+        idkronos = self._clean_document_text(self._purchase_entry_idkronos(documento), 50)
+        existing = self._document_management_existing_for_entry(documento)
+        if existing:
+            return {
+                "id": existing.get("DOC_ID"),
+                "fichero": existing.get("DOC_FICHERO"),
+                "tipo": existing.get("DOC_TIPO"),
+                "subtipo": existing.get("DOC_SUBTIPO"),
+                "formato": document_kind,
+                "idkronos": existing.get("DOC_IDKRONOS") or idkronos,
+                "existente": True,
+            }
         doc_date = self._parse_optional_date(header.get("CBM_FECHA"), date.today()) or date.today()
         doc_id = self._gestion_documental_doc_id()
         doc_tipo = "Compras"
@@ -7256,10 +9022,6 @@ class FaroPhase1Service:
             factura = self._clean_document_text(header.get("CBM_FACPRO"), 20)
             albaran = self._clean_document_text(header.get("CBM_ALBPRO"), 20)
             title_ref = factura or albaran or f"{documento.get('ejercicio')}-{documento.get('serie')}-{documento.get('numero')}"
-            idkronos = (
-                f"CABDOCM:{documento.get('centro')}-"
-                f"{documento.get('ejercicio')}-{documento.get('serie')}-{documento.get('numero')}"
-            )
             now = datetime.now()
             values = {
                 "DOC_ID": doc_id,
@@ -7289,7 +9051,7 @@ class FaroPhase1Service:
                 "DOC_TOTALS": dec(header.get("CBM_TOTALS") or (entry_result.get("totales") or {}).get("base")),
                 "DOC_TOTALD": dec(header.get("CBM_TOTALD") or (entry_result.get("totales") or {}).get("total")),
                 "DOC_SITUAC": str(header.get("CBM_SITUAC") or "P")[:1],
-                "DOC_IDKRONOS": self._clean_document_text(idkronos, 50),
+                "DOC_IDKRONOS": idkronos,
                 "DOC_KEYWORDS": self._document_keywords(
                     entry_result.get("_texto_extraido_documento"),
                     f"entrada almacen proveedor {proveedor} factura {factura} albaran {albaran}",
@@ -7303,14 +9065,16 @@ class FaroPhase1Service:
                 f"INSERT INTO DOCUMENTO ({', '.join(columns)}) VALUES ({placeholders})",
                 tuple(values[column] for column in columns),
             )
-            self.db.commit()
+            if manage_transaction:
+                self.db.commit()
         except Exception:
             try:
                 if target_path.exists():
                     target_path.unlink()
             except Exception:
                 pass
-            self.db.rollback()
+            if manage_transaction:
+                self.db.rollback()
             raise
 
         return {
@@ -7321,6 +9085,7 @@ class FaroPhase1Service:
             "subtipo": doc_subtipo,
             "formato": document_kind,
             "idkronos": values["DOC_IDKRONOS"],
+            "existente": False,
         }
 
     @staticmethod
@@ -7389,7 +9154,19 @@ class FaroPhase1Service:
                 f"{documento.get('serie')}-"
                 f"{documento.get('numero')}.{source_name}"
             )
-        return self._copy_pdf_source_to(args, self._documents_root() / "Entradas", file_name or None)
+        target_dir = self._documents_root() / "Entradas"
+        if file_name:
+            target_path = target_dir / file_name
+            if target_path.exists():
+                return {
+                    "ruta": str(target_path),
+                    "fichero": target_path.name,
+                    "bytes": target_path.stat().st_size,
+                    "existente": True,
+                }
+        result = self._copy_pdf_source_to(args, target_dir, file_name or None)
+        result["existente"] = False
+        return result
 
     def _document_management_existing_for_header(self, header: dict[str, Any]) -> dict[str, Any] | None:
         proveedor = int(header.get("proveedor") or 0)
@@ -7556,6 +9333,17 @@ class FaroPhase1Service:
                 return normalize(row)
         return None
 
+    @staticmethod
+    def _purchase_entry_existing_message(existing: dict[str, Any]) -> str:
+        return (
+            "Documento ya dado de alta "
+            f"{int(existing.get('CBM_EJERCI') or 0)}-{str(existing.get('CBM_SERIE') or '').strip()}-"
+            f"{int(existing.get('CBM_NUMDOC') or 0)} "
+            f"(proveedor={int(existing.get('CBM_CODPRO') or 0)}, "
+            f"factura={str(existing.get('CBM_FACPRO') or '').strip() or '-'}, "
+            f"albaran={str(existing.get('CBM_ALBPRO') or '').strip() or '-'})."
+        )
+
     def integrate_pending_purchase_entry_pdfs(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
         args = dict(args or {})
         pending_dir = self._gestion_documental_pending_dir()
@@ -7596,6 +9384,13 @@ class FaroPhase1Service:
                 "documentos": [],
             }
         pdfs = sorted(path for path in pending_dir.iterdir() if path.is_file() and path.suffix.lower() in supported_suffixes)
+        selected_names = {
+            Path(str(name)).name.lower()
+            for name in (args.get("selected_names") or args.get("nombres_seleccionados") or [])
+            if str(name or "").strip()
+        }
+        if selected_names:
+            pdfs = [path for path in pdfs if path.name.lower() in selected_names]
         limit = args.get("limite")
         if limit not in (None, ""):
             pdfs = pdfs[: max(0, int(limit))]
@@ -7623,6 +9418,13 @@ class FaroPhase1Service:
             try:
                 proposal = self.purchase_entry_pdf_proposal(pdf_args)
                 item["cabecera"] = proposal["cabecera"]
+                item["pdf_meta"] = proposal.get("pdf", {})
+                item["validacion"] = proposal.get("validacion", {})
+                item["totales"] = proposal.get("totales", {})
+                item["advertencias"] = proposal.get("advertencias", [])
+                item["incidencias_revision"] = self._purchase_entry_pdf_review_incidents(proposal)
+                if proposal.get("importacion"):
+                    item["importacion"] = proposal["importacion"]
                 cabecera = proposal["cabecera"]
                 if not args.get("solo_gestion_documental"):
                     self._require_purchase_entry_provider(cabecera)
@@ -7632,6 +9434,27 @@ class FaroPhase1Service:
                     f"factura={cabecera.get('factura')} albaran={cabecera.get('albaran')} "
                     f"fecha={cabecera.get('fecha')} lineas={len(proposal.get('lineas') or [])}"
                 )
+                validation = proposal.get("validacion") if isinstance(proposal.get("validacion"), dict) else {}
+                if not args.get("solo_gestion_documental") and validation.get("can_create_entry") is False:
+                    if args.get("persistir_propuesta"):
+                        proposal["importacion"] = self._persist_purchase_entry_pdf_proposal(
+                            {"persistir_propuesta": args.get("persistir_propuesta")},
+                            proposal,
+                        )
+                        item["importacion"] = proposal["importacion"]
+                    item["estado"] = "requiere_revision"
+                    item["motivo"] = (
+                        str(item["incidencias_revision"][0].get("mensaje") or "")
+                        if item["incidencias_revision"]
+                        else ", ".join(str(value) for value in proposal.get("advertencias") or []) or "Validacion pendiente"
+                    )
+                    log(
+                        "Documento pendiente revision "
+                        f"motivo={item['motivo']} total_reconciled={validation.get('total_reconciled')} "
+                        f"pages_complete={validation.get('pages_complete')}"
+                    )
+                    results.append(item)
+                    continue
                 if args.get("solo_gestion_documental"):
                     if args.get("simular"):
                         item["estado"] = "simulado_documental"
@@ -7641,7 +9464,15 @@ class FaroPhase1Service:
                         continue
                     gestion_documental = self._save_purchase_document_only(pdf_args, proposal)
                     processed_copy = self._copy_pdf_source_to(pdf_args, processed_dir)
-                    pending_deleted = self._delete_pending_document(pdf_path)
+                    try:
+                        pending_deleted = self._delete_pending_document(pdf_path)
+                    except Exception as delete_error:
+                        pending_deleted = {
+                            "ruta": str(pdf_path),
+                            "borrado": False,
+                            "error": str(delete_error),
+                            "pendiente": True,
+                        }
                     item.update({
                         "estado": "documentado",
                         "gestion_documental": gestion_documental,
@@ -7654,7 +9485,10 @@ class FaroPhase1Service:
                     else:
                         log(f"Documento guardado solo gestion documental={gestion_documental.get('ruta')}")
                     log(f"Documento copiado Procesados={processed_copy.get('ruta')}")
-                    log(f"Documento borrado Pendientes={pending_deleted.get('ruta')}")
+                    if pending_deleted.get("borrado"):
+                        log(f"Documento borrado Pendientes={pending_deleted.get('ruta')}")
+                    else:
+                        log(f"Documento pendiente no borrado ruta={pending_deleted.get('ruta')} error={pending_deleted.get('error')}")
                     results.append(item)
                     continue
                 existing = self._purchase_entry_existing_for_pdf_header(proposal["cabecera"])
@@ -7677,7 +9511,15 @@ class FaroPhase1Service:
                     continue
                 entry = self.create_purchase_entry_from_pdf(pdf_args)
                 processed_copy = self._copy_pdf_source_to(pdf_args, processed_dir)
-                pending_deleted = self._delete_pending_document(pdf_path)
+                try:
+                    pending_deleted = self._delete_pending_document(pdf_path)
+                except Exception as delete_error:
+                    pending_deleted = {
+                        "ruta": str(pdf_path),
+                        "borrado": False,
+                        "error": str(delete_error),
+                        "pendiente": True,
+                    }
                 item.update({
                     "estado": "procesado",
                     "entrada": entry.get("documento"),
@@ -7698,7 +9540,10 @@ class FaroPhase1Service:
                 log(f"Documento copiado GestionDC={gd.get('ruta')}")
                 log(f"Documento copiado DocumentosEntradas={docs_entries.get('ruta')}")
                 log(f"Documento copiado Procesados={processed_copy.get('ruta')}")
-                log(f"Documento borrado Pendientes={pending_deleted.get('ruta')}")
+                if pending_deleted.get("borrado"):
+                    log(f"Documento borrado Pendientes={pending_deleted.get('ruta')}")
+                else:
+                    log(f"Documento pendiente no borrado ruta={pending_deleted.get('ruta')} error={pending_deleted.get('error')}")
                 for incident in entry.get("incidencias_articulos") or []:
                     label = "Linea fantasma generada" if incident.get("linea_fantasma") else "Articulo no encontrado"
                     log(
@@ -7727,13 +9572,15 @@ class FaroPhase1Service:
             "procesados_ok": sum(1 for item in results if item["estado"] == "procesado"),
             "documentados": sum(1 for item in results if item["estado"] == "documentado"),
             "omitidos": sum(1 for item in results if item["estado"] == "omitido"),
+            "requiere_revision": sum(1 for item in results if item["estado"] == "requiere_revision"),
             "errores": sum(1 for item in results if item["estado"] == "error"),
             "documentos": results,
         }
         log(
             "Fin integracion "
             f"total={summary['total']} procesados_ok={summary['procesados_ok']} "
-            f"documentados={summary['documentados']} omitidos={summary['omitidos']} errores={summary['errores']}"
+            f"documentados={summary['documentados']} omitidos={summary['omitidos']} "
+            f"errores={summary['errores']} requiere_revision={summary['requiere_revision']}"
         )
         flush_log()
         return summary
@@ -7876,11 +9723,28 @@ class FaroPhase1Service:
                 header["CBM_NUMDOC"] = int(header["CBM_NUMDOC"]) + 1
 
     def _supplier_article_for_entry(self, referencia: str, proveedor: int) -> dict[str, Any] | None:
-        row = self.db.fetch_one(
-            "SELECT * FROM ARTICULP WHERE ARTP_NUMEMP=? AND ARTP_REFPRO=? AND ARTP_CODPRO=?",
-            (self.settings.empresa, referencia, proveedor),
-        )
-        return normalize(row) if row else None
+        for candidate in self._purchase_entry_reference_candidates(referencia):
+            row = self.db.fetch_one(
+                "SELECT * FROM ARTICULP WHERE ARTP_NUMEMP=? AND ARTP_REFPRO=? AND ARTP_CODPRO=?",
+                (self.settings.empresa, candidate, proveedor),
+            )
+            if row:
+                return normalize(row)
+        return None
+
+    @staticmethod
+    def _purchase_entry_reference_candidates(value: Any) -> list[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return []
+        candidates = [raw]
+        compact = re.sub(r"\s+", "", raw)
+        if compact and compact not in candidates:
+            candidates.append(compact)
+        normalized = re.sub(r"[^0-9A-Za-z]", "", raw).upper()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+        return candidates
 
     def _apply_purchase_entry_price_policy(
         self, header: dict[str, Any], supplier_article: dict[str, Any], new_price: Decimal
@@ -7919,9 +9783,10 @@ class FaroPhase1Service:
         return info
 
     def _internal_article_for_entry(self, codart: str) -> dict[str, Any] | None:
+        resolved = self.barcode_article(str(codart or "").strip()) or str(codart or "").strip()
         row = self.db.fetch_one(
             "SELECT ART_CODART, ART_DESCRI, ART_UNIMED FROM ARTICUL WHERE ART_NUMEMP=? AND ART_CODART=?",
-            (self.settings.empresa, codart),
+            (self.settings.empresa, resolved),
         )
         return normalize(row) if row else None
 
@@ -7983,12 +9848,29 @@ class FaroPhase1Service:
             )
 
     def _purchase_entry_line(self, header: dict[str, Any], raw_line: dict[str, Any], position: int) -> dict[str, Any]:
-        referencia = str(raw_line.get("referencia_proveedor") or raw_line.get("articulo") or "").strip()
+        explicit_article_code = str(raw_line.get("articulo") or "").strip()
+        printed_reference = str(raw_line.get("referencia_proveedor") or "").strip()
+        manual_article_code = explicit_article_code if (
+            printed_reference
+            and explicit_article_code
+            and str(raw_line.get("article_selection") or raw_line.get("seleccion_articulo") or "").strip().lower() == "manual"
+        ) else ""
+        referencia = str(printed_reference or explicit_article_code).strip()
         if not referencia:
             raise FaroError(f"Falta articulo en lineas[{position}]")
-        supplier_article = self._supplier_article_for_entry(referencia, int(header["CBM_CODPRO"]))
+        supplier_article = None if manual_article_code else self._supplier_article_for_entry(referencia, int(header["CBM_CODPRO"]))
         internal_article = None
-        if supplier_article:
+        if manual_article_code:
+            internal_article = self._internal_article_for_entry(manual_article_code)
+            if not internal_article:
+                raise FaroError(f"Articulo no encontrado: {manual_article_code}")
+            codart = manual_article_code
+            tiplin = "D"
+            codarp = printed_reference
+            unimed = str(raw_line.get("unidad_medida") or internal_article.get("ART_UNIMED") or "UNID").strip()
+            fallback_price = Decimal("0")
+            fallback_discounts = [Decimal("0")] * 6
+        elif supplier_article:
             codart = str(supplier_article.get("ARTP_CODART") or "").strip()
             tiplin = "D"
             codarp = str(supplier_article.get("ARTP_REFPRO") or referencia).strip()
@@ -7996,10 +9878,11 @@ class FaroPhase1Service:
             fallback_price = dec(supplier_article.get("ARTP_PREBAS"))
             fallback_discounts = [dec(supplier_article.get(f"ARTP_DTOAUM{i}")) for i in range(1, 7)]
         else:
-            internal_article = self._internal_article_for_entry(referencia)
+            internal_reference = explicit_article_code or referencia
+            internal_article = self._internal_article_for_entry(internal_reference)
             if not internal_article:
                 incident = {
-                    "referencia": referencia,
+                    "referencia": internal_reference,
                     "descripcion": str(raw_line.get("descripcion") or "")[:100],
                     "politica": str(header.get("_POLITICA_ARTICULO_NO_ENCONTRADO") or "detener"),
                     "linea_fantasma": str(header.get("_POLITICA_ARTICULO_NO_ENCONTRADO") or "detener") == "fantasma",
@@ -8008,8 +9891,8 @@ class FaroPhase1Service:
                 if isinstance(incidents, list):
                     incidents.append(incident)
                 if incident["politica"] == "detener":
-                    raise FaroError(f"Articulo no encontrado: {referencia}")
-            codart = referencia
+                    raise FaroError(f"Articulo no encontrado: {internal_reference}")
+            codart = internal_reference
             tiplin = "D" if internal_article else "X"
             codarp = ""
             unimed = str(
@@ -8019,9 +9902,10 @@ class FaroPhase1Service:
             ).strip()
             fallback_price = Decimal("0")
             fallback_discounts = [Decimal("0")] * 6
-        price = dec(raw_line.get("precio", fallback_price))
+        price_raw = raw_line.get("precio")
+        price = dec(fallback_price if price_raw in (None, "") else price_raw)
         discounts = [dec(raw_line.get(f"descuento{i}", fallback_discounts[i - 1])) for i in range(1, 7)]
-        if price == 0 and supplier_article:
+        if price_raw in (None, "") and price == 0 and supplier_article:
             price = fallback_price
             discounts = fallback_discounts
         if supplier_article:
@@ -8179,7 +10063,13 @@ class FaroPhase1Service:
         )
         return header
 
-    def create_purchase_entry(self, cabecera: dict[str, Any], lineas: list[dict[str, Any]]) -> dict[str, Any]:
+    def _create_purchase_entry_core(
+        self,
+        cabecera: dict[str, Any],
+        lineas: list[dict[str, Any]],
+        *,
+        manage_transaction: bool = True,
+    ) -> dict[str, Any]:
         if not isinstance(cabecera, dict):
             raise FaroError("cabecera debe ser un objeto")
         if not isinstance(lineas, list) or not lineas:
@@ -8196,9 +10086,11 @@ class FaroPhase1Service:
                 self._insert_detmovm_with_stock(line)
                 inserted_lines.append(line)
             header = self._finalize_purchase_entry_header(header, inserted_lines)
-            self.db.commit()
+            if manage_transaction:
+                self.db.commit()
         except Exception:
-            self.db.rollback()
+            if manage_transaction:
+                self.db.rollback()
             raise
         return {
             "ok": True,
@@ -8223,6 +10115,8 @@ class FaroPhase1Service:
                     "articulo": str(line["DMM_CODART"]),
                     "tipo_linea": str(line["DMM_TIPLIN"]),
                     "cantidad": normalize(line["DMM_CANTID"]),
+                    "precio": normalize(line["DMM_PREBAS"]),
+                    "valor_linea": normalize(line["DMM_VALLIN"]),
                     "pedido": {
                         "ejercicio": int(line["DMM_EJERCIP"]),
                         "serie": str(line["DMM_SERIEP"]),
@@ -8233,6 +10127,9 @@ class FaroPhase1Service:
                 for line in inserted_lines
             ],
         }
+
+    def create_purchase_entry(self, cabecera: dict[str, Any], lineas: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._create_purchase_entry_core(cabecera, lineas, manage_transaction=True)
 
     def get_or_create_regularization_header(self, centro: int) -> dict[str, Any]:
         today = date.today()
@@ -12638,6 +14535,231 @@ class FaroPhase1Service:
             parts.append("|".join(serialize_text_value(item[k]) for k in order))
         return {"count": len(items), "items": items, "datasnap_text": "#".join(parts) + ("#" if parts else "")}
 
+    _PROVIDER_GUIDED_FIELDS: dict[str, str] = {
+        "nombre_fiscal": "PRO_NOMFIS",
+        "nombre_comercial": "PRO_NOMCOR",
+        "nombre_abreviado": "PRO_NOMABR",
+        "domicilio": "PRO_DOMICI",
+        "codigo_postal": "PRO_CODPOS",
+        "codpos": "PRO_CODPOS",
+        "poblacion": "PRO_POBLAC",
+        "cif": "PRO_CIF",
+        "telefono": "PRO_TELEFO",
+        "fax": "PRO_FAX",
+        "email": "PRO_EMAIL",
+        "contacto": "PRO_CONTAC",
+        "codigo_representante": "PRO_CODREP",
+        "delegacion_nombre": "PRO_NOMDEL",
+        "delegacion_domicilio": "PRO_DOMDEL",
+        "delegacion_codigo_postal": "PRO_CODPOSD",
+        "delegacion_codpos": "PRO_CODPOSD",
+        "delegacion_poblacion": "PRO_POBDEL",
+        "delegacion_telefono": "PRO_TELDEL",
+        "delegacion_fax": "PRO_FAXDEL",
+        "delegacion_contacto": "PRO_CONDEL",
+        "compra_minima": "PRO_COMMIN",
+        "moneda": "PRO_CODMON",
+        "portes": "PRO_PORTES",
+        "forma_pago": "PRO_CODPAG",
+        "cuenta_contable": "PRO_CUECON",
+        "observaciones_internas": "PRO_OBSINT",
+        "observaciones_forma_pago": "PRO_OBSFOR",
+        "fecha_alta": "PRO_FEALTA",
+        "fecha_baja": "PRO_FEBAJA",
+    }
+    _PROVIDER_STRING_LIMITS: dict[str, int] = {
+        "PRO_NOMFIS": 40,
+        "PRO_NOMCOR": 40,
+        "PRO_NOMABR": 20,
+        "PRO_DOMICI": 40,
+        "PRO_POBLAC": 50,
+        "PRO_CIF": 9,
+        "PRO_TELEFO": 25,
+        "PRO_FAX": 15,
+        "PRO_EMAIL": 40,
+        "PRO_CONTAC": 40,
+        "PRO_NOMDEL": 40,
+        "PRO_DOMDEL": 40,
+        "PRO_POBDEL": 50,
+        "PRO_TELDEL": 25,
+        "PRO_FAXDEL": 15,
+        "PRO_CONDEL": 40,
+        "PRO_CODMON": 1,
+        "PRO_PORTES": 1,
+        "PRO_CUECON": 12,
+        "PRO_OBSINT": 40,
+        "PRO_OBSFOR": 40,
+        "PRO_USUMOD": 15,
+    }
+    _PROVIDER_INT_FIELDS = {"PRO_NUMEMP", "PRO_CODPRO", "PRO_CODPOS", "PRO_CODREP", "PRO_CODPOSD", "PRO_CODPAG"}
+    _PROVIDER_DECIMAL_FIELDS = {"PRO_COMMIN"}
+    _PROVIDER_DATE_FIELDS = {"PRO_FEALTA", "PRO_FEBAJA"}
+    _PROVIDER_COLUMNS = [
+        "PRO_NUMEMP", "PRO_CODPRO", "PRO_NOMFIS", "PRO_NOMCOR", "PRO_NOMABR", "PRO_DOMICI",
+        "PRO_CODPOS", "PRO_POBLAC", "PRO_CIF", "PRO_TELEFO", "PRO_FAX", "PRO_EMAIL",
+        "PRO_CONTAC", "PRO_CODREP", "PRO_NOMDEL", "PRO_DOMDEL", "PRO_CODPOSD", "PRO_POBDEL",
+        "PRO_TELDEL", "PRO_FAXDEL", "PRO_CONDEL", "PRO_COMMIN", "PRO_CODMON", "PRO_PORTES",
+        "PRO_CODPAG", "PRO_CUECON", "PRO_OBSINT", "PRO_OBSFOR", "PRO_FECMOD", "PRO_USUMOD",
+        "PRO_FEALTA", "PRO_FEBAJA",
+    ]
+
+    def _next_provider_code(self) -> int:
+        row = self.db.fetch_one(
+            "SELECT MAX(PRO_CODPRO) AS PRO_CODPRO FROM PROVEE WHERE PRO_NUMEMP=?",
+            (self.settings.empresa,),
+        )
+        return int((row or {}).get("PRO_CODPRO") or 0) + 1
+
+    def _provider_defaults(self, codpro: int) -> dict[str, Any]:
+        # PROVEE_UDM.pas: INICIALIZAR_PROVEE.
+        today = date.today()
+        return {
+            "PRO_NUMEMP": self.settings.empresa,
+            "PRO_CODPRO": codpro,
+            "PRO_NOMFIS": "",
+            "PRO_NOMCOR": "",
+            "PRO_NOMABR": "",
+            "PRO_DOMICI": "",
+            "PRO_CODPOS": 0,
+            "PRO_POBLAC": "",
+            "PRO_CIF": "",
+            "PRO_TELEFO": "",
+            "PRO_FAX": "",
+            "PRO_EMAIL": "",
+            "PRO_CONTAC": "",
+            "PRO_CODREP": 0,
+            "PRO_NOMDEL": "",
+            "PRO_DOMDEL": "",
+            "PRO_CODPOSD": 0,
+            "PRO_POBDEL": "",
+            "PRO_TELDEL": "",
+            "PRO_FAXDEL": "",
+            "PRO_CONDEL": "",
+            "PRO_COMMIN": Decimal("0"),
+            "PRO_CODMON": "E",
+            "PRO_PORTES": "N",
+            "PRO_CODPAG": 0,
+            "PRO_CUECON": "",
+            "PRO_OBSINT": "",
+            "PRO_OBSFOR": "",
+            "PRO_FECMOD": datetime.now(),
+            "PRO_USUMOD": str(self.settings.usuario or "")[:15],
+            "PRO_FEALTA": today,
+            "PRO_FEBAJA": None,
+        }
+
+    def _coerce_provider_value(self, column: str, value: Any) -> Any:
+        if column in self._PROVIDER_INT_FIELDS:
+            if value in (None, ""):
+                return 0
+            return int(value)
+        if column in self._PROVIDER_DECIMAL_FIELDS:
+            return dec(value, "0")
+        if column in self._PROVIDER_DATE_FIELDS:
+            return self._parse_optional_date(value, None)
+        if column == "PRO_FECMOD":
+            return datetime.now() if value in (None, "") else value
+        text = clean_text_value(value)
+        limit = self._PROVIDER_STRING_LIMITS.get(column)
+        if limit is not None and len(text) > limit:
+            raise FaroError(f"{column} supera la longitud maxima ({limit})")
+        return text
+
+    def _provider_data_from_args(self, datos: dict[str, Any], codpro: int) -> dict[str, Any]:
+        if not isinstance(datos, dict):
+            raise FaroError("datos debe ser un objeto")
+        provider = self._provider_defaults(codpro)
+        allowed_columns = set(self._PROVIDER_COLUMNS) - {"PRO_NUMEMP", "PRO_CODPRO", "PRO_FECMOD", "PRO_USUMOD"}
+        for key, value in datos.items():
+            raw_key = str(key or "").strip()
+            if not raw_key:
+                continue
+            column = self._PROVIDER_GUIDED_FIELDS.get(raw_key)
+            if column is None and raw_key.upper().startswith("PRO_"):
+                column = raw_key.upper()
+            if column not in allowed_columns:
+                raise FaroError(f"Campo de proveedor no permitido: {raw_key}")
+            provider[column] = self._coerce_provider_value(column, value)
+        if not provider["PRO_NOMFIS"] and provider["PRO_NOMCOR"]:
+            provider["PRO_NOMFIS"] = provider["PRO_NOMCOR"]
+        if not provider["PRO_NOMCOR"] and provider["PRO_NOMFIS"]:
+            provider["PRO_NOMCOR"] = provider["PRO_NOMFIS"]
+        if not provider["PRO_NOMABR"]:
+            provider["PRO_NOMABR"] = str(provider["PRO_NOMCOR"] or provider["PRO_NOMFIS"])[:20]
+        for required in ("PRO_NOMFIS", "PRO_CODMON", "PRO_PORTES", "PRO_CODPAG"):
+            if provider.get(required) in (None, ""):
+                raise FaroError(f"{required} es obligatorio para alta de proveedor")
+        return provider
+
+    def create_provider(
+        self,
+        datos: dict[str, Any],
+        codpro: Any = None,
+        informacion_adicional: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # Replica PROVEE_UDM.pas: NUMERAR_PROVEE + INICIALIZAR_PROVEE +
+        # GRABAR_PROVEE(..., 'G')/INSERTAR_PROVEE. Las filas PROVEEI siguen
+        # GRABAR_ADICIONAL_PROVEEDOR: NUMERAR_PROVEEI e INSERTAR_PROVEEI.
+        codigo = int(codpro) if codpro not in (None, "") else self._next_provider_code()
+        if codigo <= 0:
+            raise FaroError("El codigo de proveedor debe ser mayor que cero")
+        if self.db.fetch_one(
+            "SELECT PRO_CODPRO FROM PROVEE WHERE PRO_NUMEMP=? AND PRO_CODPRO=?",
+            (self.settings.empresa, codigo),
+        ):
+            raise FaroError(f"El proveedor {codigo} ya existe")
+
+        provider = self._provider_data_from_args(datos, codigo)
+        extra = informacion_adicional or {}
+        if not isinstance(extra, dict):
+            raise FaroError("informacion_adicional debe ser un objeto CODINF -> texto")
+
+        try:
+            self.db.execute(
+                "INSERT INTO PROVEE (" + ", ".join(self._PROVIDER_COLUMNS) + ") VALUES (" +
+                ", ".join("?" for _ in self._PROVIDER_COLUMNS) + ")",
+                tuple(provider[column] for column in self._PROVIDER_COLUMNS),
+            )
+            next_line = 1
+            row = self.db.fetch_one(
+                "SELECT MAX(PROI_NUMLIN) AS PROI_NUMLIN FROM PROVEEI WHERE PROI_NUMEMP=? AND PROI_CODPRO=?",
+                (self.settings.empresa, codigo),
+            )
+            if row and row.get("PROI_NUMLIN") is not None:
+                next_line = int(row.get("PROI_NUMLIN") or 0) + 1
+            additional_rows = []
+            for raw_code, raw_text in extra.items():
+                code = str(raw_code or "").strip().upper()
+                if not code:
+                    raise FaroError("CODINF no puede estar vacio")
+                if len(code) > 5:
+                    raise FaroError(f"CODINF demasiado largo: {code}")
+                text = clean_text_value(raw_text)
+                if len(text) > 80:
+                    raise FaroError(f"Texto de informacion adicional demasiado largo para {code}")
+                self.db.execute(
+                    "INSERT INTO PROVEEI (PROI_NUMEMP, PROI_CODPRO, PROI_NUMLIN, PROI_CODINF, PROI_TEXTO) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (self.settings.empresa, codigo, next_line, code, text),
+                )
+                additional_rows.append({"linea": next_line, "codigo": code, "texto": text})
+                next_line += 1
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+        row = self.db.fetch_one(
+            "SELECT * FROM PROVEE WHERE PRO_NUMEMP=? AND PRO_CODPRO=?",
+            (self.settings.empresa, codigo),
+        )
+        return {
+            "codigo": codigo,
+            "creado": True,
+            "proveedor": self._provider_ficha_fields(normalize(row or provider)),
+            "informacion_adicional": additional_rows,
+        }
+
     def save_client(self, texto: str) -> dict[str, Any]:
         # Replica Grabar_Cliente. Formato TEXTO (10 campos separados por '|'):
         # CODCLI|SUBCLI|NOMCLI|RAZSOC|DOMICI|CODPOS|POBLAC|TELEFO|EMAIL|CIF
@@ -15800,6 +17922,7 @@ CORE_PUBLIC_TOOL_NAMES = frozenset({
     "articulo_familiancc_tabla_guardar",
     "tarifa_proveedor_actualizar",
     "proveedor_buscar",
+    "proveedor_alta",
     # Clientes / CRM.
     "cliente_buscar",
     "cliente_actualizar",
@@ -15821,6 +17944,11 @@ CORE_PUBLIC_TOOL_NAMES = frozenset({
     "entrada_almacen_desde_pdf",
     "entrada_almacen_desde_imagen",
     "entrada_almacen_pendientes_integrar",
+    "entrada_almacen_propuesta_confirmar",
+    "entrada_almacen_propuesta_borrar",
+    "entrada_almacen_propuesta_guardar",
+    "entrada_almacen_propuesta_reintentar_documento",
+    "entrada_almacen_propuestas_listar",
     "entrada_almacen_imagen_previsualizar",
     "entrada_almacen_pdf_previsualizar",
     "etiqueta_gestion",
@@ -15928,6 +18056,11 @@ CENTER_SCOPED_TOOL_NAMES = frozenset(
         "entrada_almacen_desde_pdf",
         "entrada_almacen_desde_imagen",
         "entrada_almacen_pendientes_integrar",
+        "entrada_almacen_propuesta_confirmar",
+        "entrada_almacen_propuesta_borrar",
+        "entrada_almacen_propuesta_guardar",
+        "entrada_almacen_propuesta_reintentar_documento",
+        "entrada_almacen_propuestas_listar",
         "entrada_almacen_imagen_previsualizar",
         "entrada_almacen_pdf_previsualizar",
         "entrada_pedidos_relacionados",
@@ -15997,6 +18130,7 @@ READ_ONLY_TOOL_NAMES = frozenset({
     "comercial_agente_visitas_ventas_oportunidades",
     "entrada_almacen_imagen_previsualizar",
     "entrada_almacen_pdf_previsualizar",
+    "entrada_almacen_propuestas_listar",
     "entrada_pedidos_relacionados",
     "integracion_coinfer_stock",
     "pedido_detalle",
@@ -16055,6 +18189,7 @@ WRITE_TOOL_NAMES = frozenset({
     "articulo_familiancc_tabla_guardar",
     "articulo_ubicacion_guardar",
     "cliente_actualizar",
+    "proveedor_alta",
     "etiqueta_gestion",
     "falta_gestion",
     "oferta_crear",
@@ -16080,6 +18215,10 @@ CRITICAL_TOOL_NAMES = frozenset({
     "entrada_almacen_desde_pdf",
     "entrada_almacen_desde_imagen",
     "entrada_almacen_pendientes_integrar",
+    "entrada_almacen_propuesta_confirmar",
+    "entrada_almacen_propuesta_borrar",
+    "entrada_almacen_propuesta_guardar",
+    "entrada_almacen_propuesta_reintentar_documento",
     "pedido_enviar",
     "pedido_finalizar",
     "stock_regularizar",
@@ -16371,6 +18510,11 @@ class FaroToolRuntime:
             'entrada_almacen_desde_pdf': self.tool_entrada_almacen_desde_pdf,
             'entrada_almacen_desde_imagen': self.tool_entrada_almacen_desde_imagen,
             'entrada_almacen_pendientes_integrar': self.tool_entrada_almacen_pendientes_integrar,
+            'entrada_almacen_propuesta_confirmar': self.tool_entrada_almacen_propuesta_confirmar,
+            'entrada_almacen_propuesta_borrar': self.tool_entrada_almacen_propuesta_borrar,
+            'entrada_almacen_propuesta_guardar': self.tool_entrada_almacen_propuesta_guardar,
+            'entrada_almacen_propuesta_reintentar_documento': self.tool_entrada_almacen_propuesta_reintentar_documento,
+            'entrada_almacen_propuestas_listar': self.tool_entrada_almacen_propuestas_listar,
             'entrada_almacen_imagen_previsualizar': self.tool_entrada_almacen_imagen_previsualizar,
             'entrada_almacen_pdf_previsualizar': self.tool_entrada_almacen_pdf_previsualizar,
             'entrada_pedidos_relacionados': self.tool_entrada_pedidos_relacionados,
@@ -16406,6 +18550,7 @@ class FaroToolRuntime:
             'precio_tabla_listar': self.tool_precio_tabla_listar,
             'proveedores_resumen': self.tool_proveedores_resumen,
             'proveedor_buscar': self.tool_proveedor_buscar,
+            'proveedor_alta': self.tool_proveedor_alta,
             'recuento_gestion': self.tool_recuento_gestion,
             'stock_consultar': self.tool_stock_consultar,
             'stock_regularizar': self.tool_stock_regularizar,
@@ -16777,6 +18922,17 @@ class FaroToolRuntime:
                 int(args.get("limit", MAX_ROWS_DEFAULT)),
             )
             return {"modo": "listado", **result}
+        finally:
+            svc.db.close()
+
+    def tool_proveedor_alta(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.create_provider(
+                args.get("datos") or {},
+                args.get("codpro"),
+                args.get("informacion_adicional") or {},
+            )
         finally:
             svc.db.close()
 
@@ -17256,6 +19412,41 @@ class FaroToolRuntime:
         svc = self.phase1_service()
         try:
             return svc.integrate_pending_purchase_entry_pdfs(args)
+        finally:
+            svc.db.close()
+
+    def tool_entrada_almacen_propuesta_confirmar(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.confirm_purchase_entry_importation(args)
+        finally:
+            svc.db.close()
+
+    def tool_entrada_almacen_propuesta_borrar(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.delete_purchase_entry_importation_revision(args)
+        finally:
+            svc.db.close()
+
+    def tool_entrada_almacen_propuesta_guardar(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.save_purchase_entry_importation_revision(args)
+        finally:
+            svc.db.close()
+
+    def tool_entrada_almacen_propuesta_reintentar_documento(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.retry_purchase_entry_importation_documentation(args)
+        finally:
+            svc.db.close()
+
+    def tool_entrada_almacen_propuestas_listar(self, args: dict[str, Any]) -> Any:
+        svc = self.phase1_service()
+        try:
+            return svc.list_purchase_entry_importations(args)
         finally:
             svc.db.close()
 
@@ -18426,6 +20617,16 @@ _INTERNAL_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {'actividad_grabar': {'d
                                                      'nombre_fiscal_like': {'type': 'string'}},
                                       'type': 'object'},
                       'name': 'proveedor_buscar'},
+ 'proveedor_alta': {'description': 'Proveedores. ESCRITURA. Da de alta un proveedor en PROVEE y opcionalmente informacion adicional en PROVEEI, replicando PROVEE_UDM.pas.',
+                    'inputSchema': {'properties': {'codpro': {'description': 'Codigo de proveedor (PRO_CODPRO). Si se omite se numera como NUMERAR_PROVEE.',
+                                                              'type': 'integer'},
+                                                   'datos': {'type': 'object'},
+                                                   'informacion_adicional': {'additionalProperties': {'type': 'string'},
+                                                                             'description': 'Mapa CODINF -> texto para PROVEEI.',
+                                                                             'type': 'object'}},
+                                    'required': ['datos'],
+                                    'type': 'object'},
+                    'name': 'proveedor_alta'},
  'recuento_gestion': {'description': 'Almacen. Gestiona recuentos con accion=listar, grabar o borrar. centro es '
                                      'obligatorio; listar admite codart opcional.',
                       'inputSchema': {'properties': {'accion': {'default': 'listar',
@@ -19795,6 +21996,11 @@ _INTERNAL_TOOL_DEFINITIONS.update({
                 "fecha": {"type": "string", "description": "Fecha por defecto si el PDF no contiene fecha."},
                 "limite": {"type": "integer", "description": "Maximo de PDFs a procesar en esta ejecucion."},
                 "limite_lineas": {"type": "integer", "description": "Maximo de lineas candidatas por PDF."},
+                "selected_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Nombres exactos de ficheros pendientes a procesar; los no seleccionados permanecen en Pendientes.",
+                },
                 "texto_extraido": {
                     "type": "string",
                     "description": "Texto OCR opcional para aplicar a una prueba puntual; normalmente se omite.",
@@ -19819,10 +22025,150 @@ _INTERNAL_TOOL_DEFINITIONS.update({
                         "pero no crea entrada de almacen ni movimientos de stock."
                     ),
                 },
+                "persistir_propuesta": {
+                    "type": ["boolean", "string"],
+                    "default": False,
+                    "description": (
+                        "Si es true guarda la propuesta en GDC_IMPORTACION para revision posterior. "
+                        "Con 'obligatorio' falla si no puede persistirla."
+                    ),
+                },
                 "simular": {
                     "type": "boolean",
                     "default": False,
                     "description": "Si es true solo previsualiza y comprueba duplicados; no graba entradas ni copia PDFs.",
+                },
+            },
+        },
+    },
+    "entrada_almacen_propuesta_confirmar": {
+        "name": "entrada_almacen_propuesta_confirmar",
+        "description": (
+            "Compras/almacen. CRITICA. Confirma una propuesta guardada en GDC_IMPORTACION sin reinterpretar "
+            "el PDF; comprueba version/hash/estado y crea la entrada de almacen si sigue siendo valida."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "propuesta_id": {
+                    "type": "string",
+                    "description": "Identificador GDI_ID devuelto al persistir la propuesta.",
+                },
+                "version": {
+                    "type": "integer",
+                    "description": "Version esperada de la propuesta guardada.",
+                },
+                "hash_sha256": {
+                    "type": "string",
+                    "description": "Hash SHA-256 esperado del archivo original.",
+                },
+                "cabecera": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "Correcciones finales de cabecera sobre la propuesta guardada.",
+                },
+                "lineas": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Lineas revisadas finales; si se omite se usan las guardadas en la propuesta.",
+                },
+            },
+            "required": ["propuesta_id", "version", "hash_sha256"],
+        },
+    },
+    "entrada_almacen_propuesta_borrar": {
+        "name": "entrada_almacen_propuesta_borrar",
+        "description": (
+            "Compras/almacen. CRITICA. Borra una propuesta de revision GDC_IMPORTACION no confirmada, "
+            "validando version y hash para evitar borrar una revision obsoleta."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "propuesta_id": {"type": "string", "description": "Identificador GDI_ID de la propuesta."},
+                "version": {"type": "integer", "description": "Version actual esperada."},
+                "hash_sha256": {"type": "string", "description": "Hash SHA-256 esperado del archivo original."},
+            },
+            "required": ["propuesta_id", "version", "hash_sha256"],
+        },
+    },
+    "entrada_almacen_propuesta_guardar": {
+        "name": "entrada_almacen_propuesta_guardar",
+        "description": (
+            "Compras/almacen. CRITICA. Guarda correcciones de una propuesta GDC_IMPORTACION como nueva version "
+            "sin crear entrada; recalcula la conciliacion para la confirmacion posterior."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "propuesta_id": {"type": "string", "description": "Identificador GDI_ID de la propuesta."},
+                "version": {"type": "integer", "description": "Version actual esperada."},
+                "hash_sha256": {"type": "string", "description": "Hash SHA-256 esperado del archivo original."},
+                "cabecera": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "Correcciones de cabecera a persistir.",
+                },
+                "lineas": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Lineas revisadas a persistir.",
+                },
+            },
+            "required": ["propuesta_id", "version", "hash_sha256"],
+        },
+    },
+    "entrada_almacen_propuesta_reintentar_documento": {
+        "name": "entrada_almacen_propuesta_reintentar_documento",
+        "description": (
+            "Compras/almacen. CRITICA. Reintenta el archivo en gestion documental de una propuesta ya CONFIRMADA "
+            "sin crear otra entrada ni duplicar movimientos de stock."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "propuesta_id": {"type": "string", "description": "Identificador GDI_ID de la propuesta confirmada."},
+                "ruta_pdf": {"type": "string", "description": "Ruta alternativa del PDF original si la guardada no existe."},
+                "ruta_imagen": {"type": "string", "description": "Ruta alternativa de imagen original si procede."},
+                "content_base64": {"type": "string", "description": "PDF original en Base64 si se reintenta desde subida."},
+                "content_base64_imagen": {"type": "string", "description": "Imagen original en Base64 si se reintenta desde subida."},
+                "nombre_fichero": {"type": "string", "description": "Nombre visible del fichero original."},
+                "copiar_documentos_entradas": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Tambien reintenta la copia en Documentos/Entradas.",
+                },
+            },
+            "required": ["propuesta_id"],
+        },
+    },
+    "entrada_almacen_propuestas_listar": {
+        "name": "entrada_almacen_propuestas_listar",
+        "description": (
+            "Compras/almacen. LECTURA. Lista propuestas guardadas en GDC_IMPORTACION, por defecto pendientes "
+            "de revision o revisadas, incluyendo cabecera/lineas/totales para abrirlas en la pantalla de revision."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "estados": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Estados GDI_ESTADO a consultar. Por defecto PROPUESTA y REVISADA.",
+                },
+                "limite": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Maximo de propuestas a devolver.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "Numero de propuestas coincidentes a saltar para paginacion.",
+                },
+                "busqueda": {
+                    "type": "string",
+                    "description": "Filtro por identificador, ruta/origen, factura o albaran.",
                 },
             },
         },
@@ -20019,6 +22365,41 @@ _CLIENT_DATA_SCHEMA: dict[str, Any] = {
     ],
 }
 
+_PROVIDER_DATA_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "nombre_fiscal": {"type": "string", "description": "PRO_NOMFIS. Si se omite, se toma de nombre_comercial."},
+        "nombre_comercial": {"type": "string", "description": "PRO_NOMCOR. Si se omite, se toma de nombre_fiscal."},
+        "nombre_abreviado": {"type": "string", "description": "PRO_NOMABR; por defecto los primeros 20 caracteres del nombre."},
+        "domicilio": {"type": "string"},
+        "codigo_postal": {"type": ["integer", "string"]},
+        "poblacion": {"type": "string"},
+        "cif": {"type": "string"},
+        "telefono": {"type": "string"},
+        "fax": {"type": "string"},
+        "email": {"type": "string"},
+        "contacto": {"type": "string"},
+        "codigo_representante": {"type": "integer", "default": 0},
+        "delegacion_nombre": {"type": "string"},
+        "delegacion_domicilio": {"type": "string"},
+        "delegacion_codigo_postal": {"type": ["integer", "string"]},
+        "delegacion_poblacion": {"type": "string"},
+        "delegacion_telefono": {"type": "string"},
+        "delegacion_fax": {"type": "string"},
+        "delegacion_contacto": {"type": "string"},
+        "compra_minima": {"type": ["number", "string"], "default": 0},
+        "moneda": {"type": "string", "default": "E", "description": "PRO_CODMON; por defecto E."},
+        "portes": {"type": "string", "default": "N", "description": "PRO_PORTES; por defecto N, igual que INICIALIZAR_PROVEE."},
+        "forma_pago": {"type": "integer", "default": 0},
+        "cuenta_contable": {"type": "string"},
+        "observaciones_internas": {"type": "string"},
+        "observaciones_forma_pago": {"type": "string"},
+        "fecha_alta": {"type": "string", "description": "AAAA-MM-DD o DD/MM/AAAA. Por defecto hoy."},
+        "fecha_baja": {"type": "string", "description": "AAAA-MM-DD o DD/MM/AAAA."},
+    },
+}
+
 _ARTICLE_ORDER_BY_TO_INTERNAL: dict[str, str] = {
     "codigo": "ART_CODART",
     "descripcion": "ART_DESCRI",
@@ -20085,6 +22466,13 @@ def _build_public_tool_definitions() -> dict[str, dict[str, Any]]:
     definitions["cliente_actualizar"]["inputSchema"]["required"] = ["datos"]
     definitions["cliente_actualizar"]["description"] = (
         "Clientes. ESCRITURA. Actualiza un cliente existente mediante un objeto de datos estructurado."
+    )
+
+    definitions["proveedor_alta"]["inputSchema"]["properties"]["datos"] = _PROVIDER_DATA_SCHEMA
+    definitions["proveedor_alta"]["inputSchema"]["required"] = ["datos"]
+    definitions["proveedor_alta"]["description"] = (
+        "Proveedores. ESCRITURA. Da de alta un proveedor en PROVEE y opcionalmente PROVEEI, "
+        "replicando INICIALIZAR_PROVEE, NUMERAR_PROVEE e INSERTAR_PROVEE de PROVEE_UDM.pas."
     )
 
     definitions["pedido_crear"]["inputSchema"]["properties"]["lineas"] = {

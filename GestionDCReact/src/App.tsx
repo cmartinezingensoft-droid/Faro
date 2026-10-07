@@ -1,7 +1,10 @@
 import {
   AlertTriangle,
   Archive,
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
+  CircleHelp,
   ClipboardCheck,
   Columns3,
   Database,
@@ -17,12 +20,14 @@ import {
   Maximize2,
   RefreshCw,
   Search,
+  Settings,
   Square,
   SquareCheck,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 type FileKind = 'pdf' | 'image' | 'text' | 'file';
 
@@ -54,6 +59,7 @@ type Mode = {
 type AppState = {
   mainDir: string;
   gestionDir: string;
+  aiConfig?: AiConfig;
   modes: Record<string, Mode>;
   counts: {
     pending: number;
@@ -75,9 +81,121 @@ type RunResult = {
   selectedNames: string[];
   stdout: string;
   stderr: string;
+  structuredResult?: {
+    total?: number;
+    procesados_ok?: number;
+    documentados?: number;
+    omitidos?: number;
+    requiere_revision?: number;
+    errores?: number;
+    advertencias?: string[];
+    documentos?: DocumentResult[];
+  } | null;
   latestLog?: LogItem | null;
   state?: AppState;
 };
+
+type DocumentResult = {
+      pdf?: string;
+      pdf_meta?: {
+        page_count?: number;
+        blank_pages?: number[];
+        processed_pages?: number[];
+      };
+      estado?: string;
+      motivo?: string;
+      error?: string;
+      cabecera?: Record<string, unknown>;
+      validacion?: Record<string, unknown>;
+      totales?: Record<string, unknown>;
+      advertencias?: string[];
+      incidencias_revision?: Array<{
+        codigo?: string;
+        mensaje?: string;
+        referencias?: string[];
+        descripciones?: string[];
+      }>;
+      importacion?: {
+        id?: string;
+        estado?: string;
+        version?: number;
+        hash_sha256?: string;
+        persistida?: boolean;
+      };
+      lineas_pdf_detectadas?: number;
+      lineas_documento_detectadas?: number;
+      lineas?: Array<Record<string, unknown>>;
+      entrada?: Record<string, unknown>;
+      documento_existente?: Record<string, unknown>;
+      pendiente_borrado?: Record<string, unknown>;
+};
+
+type ConfirmResult = {
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  structuredResult?: {
+    ok?: boolean;
+    documento?: Record<string, unknown>;
+    importacion?: Record<string, unknown>;
+    pendiente_borrado?: Record<string, unknown>;
+    error?: {
+      message?: string;
+    };
+  } | null;
+  state?: AppState;
+};
+
+type ImportationsResult = {
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  structuredResult?: {
+    ok?: boolean;
+    total?: number;
+    offset?: number;
+    limite?: number;
+    busqueda?: string;
+    documentos?: DocumentResult[];
+    error?: {
+      message?: string;
+    };
+  } | null;
+};
+
+type SaveRevisionResult = ConfirmResult & {
+  structuredResult?: {
+    ok?: boolean;
+    importacion?: {
+      id?: string;
+      estado?: string;
+      version?: number;
+      hash_sha256?: string;
+    };
+    validacion?: Record<string, unknown>;
+    totales?: Record<string, unknown>;
+    error?: {
+      message?: string;
+    };
+  } | null;
+};
+
+type RetryDocumentResult = ConfirmResult & {
+  structuredResult?: {
+    ok?: boolean;
+    documento?: Record<string, unknown>;
+    importacion?: Record<string, unknown>;
+    gestion_documental?: Record<string, unknown>;
+    documentos_entradas?: Record<string, unknown> | null;
+    error?: {
+      message?: string;
+    };
+  } | null;
+};
+
+type DeleteRevisionResult = SaveRevisionResult;
 
 type UploadResult = {
   ok: boolean;
@@ -98,6 +216,20 @@ type ProcessOptions = {
   updatePrices: boolean;
   updateOnlyIfUp: boolean;
   ghostLines: boolean;
+  aiFallback: boolean;
+};
+
+type AiConfig = {
+  enabled: boolean;
+  provider: string;
+  endpoint: string;
+  model: string;
+  apiKey?: string;
+  hasApiKey?: boolean;
+  temperature: number;
+  maxTokens: number;
+  timeoutSeconds: number;
+  prompt: string;
 };
 
 type Notice = {
@@ -105,6 +237,14 @@ type Notice = {
   message: string;
   details?: string[];
   variant?: 'info' | 'warning';
+};
+
+type ConfirmDialogState = {
+  title: string;
+  message: string;
+  confirmText?: string;
+  cancelText?: string;
+  variant?: 'question' | 'danger';
 };
 
 function formatBytes(value: number) {
@@ -159,26 +299,257 @@ function logHasIncidents(log?: LogItem | null) {
 }
 
 function runHasIncidents(result: RunResult) {
+  const structured = result.structuredResult;
+  if (structured) {
+    return !result.ok
+      || Number(structured.errores || 0) > 0
+      || Number(structured.omitidos || 0) > 0
+      || Number(structured.requiere_revision || 0) > 0
+      || Boolean(structured.documentos?.some((item) => item.pendiente_borrado?.borrado === false))
+      || Boolean(structured.documentos?.some((item) => item.estado === 'error' || item.estado === 'omitido' || item.estado === 'requiere_revision'));
+  }
   return !result.ok || logHasIncidents(result.latestLog);
 }
 
+function runHasConfirmableProposals(result: RunResult) {
+  return Boolean(result.structuredResult?.documentos?.some((item) => (
+    item.estado === 'propuesta'
+    || (item.importacion?.id && item.validacion?.can_create_entry !== false && item.estado !== 'procesado' && item.estado !== 'documentado')
+  )));
+}
+
+function isMissingArticleIncidentText(value?: string) {
+  return /unresolved_article|articulo no encontrado|artículos? no encontrados?|referencia de proveedor no encontrada/i.test(String(value || ''));
+}
+
+function runHasMissingArticleIncident(result: RunResult) {
+  const structured = result.structuredResult;
+  if (structured?.advertencias?.some((warning) => isMissingArticleIncidentText(warning))) return true;
+  if (structured?.documentos?.some((item) => (
+    Number(item.validacion?.unresolved_lines || 0) > 0
+    || item.incidencias_revision?.some((incident) => isMissingArticleIncidentText(incident.codigo) || isMissingArticleIncidentText(incident.mensaje))
+    || isMissingArticleIncidentText(item.motivo)
+    || isMissingArticleIncidentText(item.error)
+  ))) return true;
+  const content = result.latestLog?.content || '';
+  return content.split(/\r?\n/).map(logMessage).some((line) => /Articulo no encontrado/i.test(line) && !isGhostArticleLine(line));
+}
+
+function existingEntryText(existing?: Record<string, unknown>) {
+  if (!existing) return '';
+  const centro = existing.CBM_CENTRO ?? existing.centro;
+  const ejercicio = existing.CBM_EJERCI ?? existing.ejercicio;
+  const serie = existing.CBM_SERIE ?? existing.serie;
+  const numero = existing.CBM_NUMDOC ?? existing.numero;
+  const entry = [ejercicio, serie, numero].filter((value) => String(value ?? '').trim()).join('-');
+  return [centro !== undefined && centro !== null && String(centro).trim() ? `centro ${centro}` : '', entry ? `entrada ${entry}` : '']
+    .filter(Boolean)
+    .join(', ');
+}
+
+function duplicateDocumentIncident(result: RunResult) {
+  return result.structuredResult?.documentos?.find((item) => (
+    item.documento_existente
+    || /documento ya dado de alta|ya dado de alta/i.test(`${item.motivo || ''} ${item.error || ''}`)
+  ));
+}
+
+function hasProviderIncidentText(value?: string) {
+  return /proveedor (?:no encontrado|inexistente)|proveedor no existe|cif=.*proveedor/i.test(String(value || ''));
+}
+
+function runHasProviderIncident(result: RunResult) {
+  const structured = result.structuredResult;
+  if (structured?.documentos?.some((item) => (
+    hasProviderIncidentText(item.motivo)
+    || hasProviderIncidentText(item.error)
+    || item.incidencias_revision?.some((incident) => hasProviderIncidentText(incident.mensaje))
+  ))) return true;
+  const content = result.latestLog?.content || '';
+  return content.split(/\r?\n/).map(logMessage).some((line) => hasProviderIncidentText(line));
+}
+
+function normalizeIncidentText(value: unknown) {
+  return textValue(value)
+    .replace(/\uFFFD/g, 'á')
+    .replace(/\bestá\b/gi, (match) => (match[0] === 'E' ? 'Está' : 'está'))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isFileLockedIncidentText(value?: string) {
+  return /WinError 32|no tiene acceso al archivo porque .*siendo utilizado por otro proceso|being used by another process/i.test(normalizeIncidentText(value));
+}
+
+function runHasFileLockedIncident(result: RunResult) {
+  const structured = result.structuredResult;
+  if (structured?.documentos?.some((item) => isFileLockedIncidentText(item.error) || isFileLockedIncidentText(item.motivo))) return true;
+  const content = result.latestLog?.content || '';
+  return content.split(/\r?\n/).map(logMessage).some((line) => isFileLockedIncidentText(line));
+}
+
+function isNoDetailLinesIncidentText(value?: string) {
+  return /no se han detectado lineas de detalle suficientes|no se detectaron lineas de entrada|no_lines_detected/i.test(normalizeIncidentText(value));
+}
+
+function runHasNoDetailLinesIncident(result: RunResult) {
+  const structured = result.structuredResult;
+  if (structured?.documentos?.some((item) => (
+    item.validacion?.no_lines_detected === true
+    || isNoDetailLinesIncidentText(item.motivo)
+    || isNoDetailLinesIncidentText(item.error)
+    || item.incidencias_revision?.some((incident) => isNoDetailLinesIncidentText(incident.codigo) || isNoDetailLinesIncidentText(incident.mensaje))
+  ))) return true;
+  const content = result.latestLog?.content || '';
+  return content.split(/\r?\n/).map(logMessage).some((line) => isNoDetailLinesIncidentText(line));
+}
+
+function runHasTotalMismatchIncident(result: RunResult) {
+  return Boolean(result.structuredResult?.documentos?.some((item) => (
+    item.validacion?.total_reconciled === false
+    || item.advertencias?.some((warning) => /total_mismatch|descuadre/i.test(String(warning || '')))
+    || item.incidencias_revision?.some((incident) => /total_mismatch|total calculado no cuadra/i.test(`${incident.codigo || ''} ${incident.mensaje || ''}`))
+  )));
+}
+
+function entryText(entry?: Record<string, unknown>) {
+  if (!entry) return '';
+  const centro = entry.centro ?? entry.CBM_CENTRO;
+  const ejercicio = entry.ejercicio ?? entry.CBM_EJERCI;
+  const serie = entry.serie ?? entry.CBM_SERIE;
+  const numero = entry.numero ?? entry.CBM_NUMDOC;
+  const doc = [ejercicio, serie, numero].filter((value) => String(value ?? '').trim()).join('-');
+  return [centro !== undefined && centro !== null && String(centro).trim() ? `centro ${centro}` : '', doc ? `entrada ${doc}` : '']
+    .filter(Boolean)
+    .join(', ');
+}
+
+function pendingDeleteIncident(result: RunResult) {
+  return result.structuredResult?.documentos?.find((item) => (
+    (item.estado === 'procesado' || item.estado === 'documentado')
+    && item.pendiente_borrado?.borrado === false
+  ));
+}
+
 function incidentMessage(result: RunResult) {
+  const pendingDelete = pendingDeleteIncident(result);
+  if (pendingDelete) {
+    const entry = entryText(pendingDelete.entrada);
+    const prefix = entry ? `Entrada generada correctamente: ${entry}.` : 'Documento integrado correctamente.';
+    return `${prefix} No se ha podido borrar el PDF pendiente porque está abierto o bloqueado por otro proceso.`;
+  }
+  const duplicate = duplicateDocumentIncident(result);
+  if (duplicate) {
+    const existing = existingEntryText(duplicate.documento_existente);
+    return existing
+      ? `Documento ya dado de alta. Entrada existente: ${existing}.`
+      : 'Documento ya dado de alta.';
+  }
+  if (runHasTotalMismatchIncident(result)) {
+    return 'No se ha podido procesar porque el total calculado no cuadra con el documento.';
+  }
+  if (runHasMissingArticleIncident(result)) {
+    return 'No se ha podido procesar porque no se ha encontrado el articulo.';
+  }
+  if (runHasProviderIncident(result)) {
+    return 'No se ha podido procesar porque el proveedor no existe.';
+  }
+  if (runHasFileLockedIncident(result)) {
+    return 'No se ha podido procesar porque el PDF está abierto o bloqueado por otro proceso.';
+  }
+  if (runHasNoDetailLinesIncident(result)) {
+    return 'No se ha podido procesar porque no se han detectado líneas de detalle.';
+  }
+  const structured = result.structuredResult;
+  const incident = structured?.documentos?.find((item) => item.estado === 'error' || item.estado === 'requiere_revision' || item.estado === 'omitido');
+  if (incident) {
+    const reviewMessage = incident.incidencias_revision?.find((item) => item.mensaje)?.mensaje;
+    return normalizeIncidentText(incident.error || reviewMessage || incident.motivo || `Documento ${incident.estado || 'con incidencias'}`);
+  }
   const content = result.latestLog?.content || '';
   const messages = content.split(/\r?\n/).map(logMessage).filter(Boolean);
   const cause = messages.find((line) => !isGhostArticleLine(line) && /\bERROR\b|Proveedor no encontrado|Articulo no encontrado|Documento omitido|ya dado de alta|No se pudo/i.test(line));
-  return cause || result.latestLog?.cause || result.latestLog?.summaryLine || result.stderr || 'La integracion ha finalizado con incidencias.';
+  return normalizeIncidentText(cause || result.latestLog?.cause || result.latestLog?.summaryLine || result.stderr || 'La integracion ha finalizado con incidencias.');
 }
 
 function highlightedNoticeMessage(message: string) {
-  const parts = message.split(/(Proveedor no encontrado|Articulo no encontrado|Artículo no encontrado)/i);
+  const normalizedMessage = normalizeIncidentText(message);
+  const parts = normalizedMessage.split(/(Entrada generada correctamente:[^.]*(?:\.)?|Documento integrado correctamente|Documento ya dado de alta|Entrada existente:[^.]*(?:\.)?|Proveedor no encontrado|proveedor no existe|proveedor inexistente|Articulo no encontrado|Artículo no encontrado|articulo no encontrado|PDF está abierto|bloqueado por otro proceso|no se han detectado líneas de detalle|No se ha podido procesar|ERROR|No se pudo)/i);
   return parts.map((part, index) => (
-    /Proveedor no encontrado|Articulo no encontrado|Artículo no encontrado/i.test(part)
+    /Entrada generada correctamente|Documento integrado correctamente|Documento ya dado de alta|Entrada existente|Proveedor no encontrado|proveedor no existe|proveedor inexistente|Articulo no encontrado|Artículo no encontrado|articulo no encontrado|PDF está abierto|bloqueado por otro proceso|no se han detectado líneas de detalle|No se ha podido procesar|ERROR|No se pudo/i.test(part)
       ? <span className="noticeErrorText" key={`${part}-${index}`}>{part}</span>
       : part
   ));
 }
 
 function integrationReport(result: RunResult) {
+  const pendingDelete = pendingDeleteIncident(result);
+  if (pendingDelete) {
+    const entry = entryText(pendingDelete.entrada);
+    const path = String(pendingDelete.pendiente_borrado?.ruta || '').trim();
+    return [
+      ...(entry ? [`Entrada generada: ${entry}`] : []),
+      ...(path ? [`PDF pendiente: ${path}`] : []),
+    ];
+  }
+  const duplicate = duplicateDocumentIncident(result);
+  if (duplicate) {
+    const existing = existingEntryText(duplicate.documento_existente);
+    return existing ? [`Entrada existente: ${existing}`] : [];
+  }
+  if (runHasMissingArticleIncident(result)) {
+    return [];
+  }
+  if (runHasProviderIncident(result)) {
+    return [];
+  }
+  if (runHasFileLockedIncident(result)) {
+    return [];
+  }
+  if (runHasNoDetailLinesIncident(result)) {
+    return [];
+  }
+  const structured = result.structuredResult;
+  if (structured) {
+    const details: string[] = [
+      `Documentos detectados: ${Number(structured.total || 0)}`,
+      `Procesados correctamente: ${Number(structured.procesados_ok || 0)}`,
+      `Propuestas listas para confirmar: ${structured.documentos?.filter((item) => item.estado === 'propuesta').length || 0}`,
+      `Solo documentados: ${Number(structured.documentados || 0)}`,
+      `Pendientes de revision: ${Number(structured.requiere_revision || 0)}`,
+      `Omitidos: ${Number(structured.omitidos || 0)}`,
+      `Errores: ${Number(structured.errores || 0)}`,
+    ];
+    const confirmableCount = structured.documentos?.filter((item) => item.estado === 'propuesta').length || 0;
+    if (confirmableCount > 0) {
+      details.push('Entrada de almacen no creada: falta pulsar Confirmar propuesta en Revision.');
+    }
+    structured.documentos?.forEach((item) => {
+      const name = item.pdf ? item.pdf.split(/[\\/]/).pop() : 'documento';
+      if (item.estado === 'procesado' && item.entrada) {
+        const entry = item.entrada as Record<string, unknown>;
+        details.push(`${name}: entrada ${entry.ejercicio || ''}-${entry.serie || ''}-${entry.numero || ''}`);
+      }
+      if (item.estado === 'documentado') details.push(`${name}: archivado sin entrada`);
+      if (item.estado === 'propuesta') {
+        const reviewId = item.importacion?.id ? ` propuesta ${item.importacion.id}` : '';
+        details.push(`${name}: entrada no creada; pendiente de confirmar propuesta IA${reviewId}`);
+      }
+      if (item.estado === 'requiere_revision') {
+        const reviewId = item.importacion?.id ? ` propuesta ${item.importacion.id}` : '';
+        details.push(`${name}: requiere revision${reviewId} (${item.motivo || 'validacion pendiente'})`);
+        item.incidencias_revision?.forEach((incident) => {
+          if (incident.mensaje) details.push(`${name}: ${incident.mensaje}`);
+        });
+      }
+      if (item.estado === 'omitido') details.push(`${name}: omitido (${item.motivo || 'duplicado o politica de lote'})`);
+      if (item.estado === 'error') details.push(`${name}: error (${item.error || 'sin detalle'})`);
+      if (item.validacion?.total_reconciled === false && item.totales) {
+        details.push(`${name}: descuadre total documento ${item.totales.source_gross ?? '?'} / calculado ${item.totales.computed_gross ?? '?'}`);
+      }
+    });
+    return details;
+  }
   const content = result.latestLog?.content || '';
   const messages = content.split(/\r?\n/).map(logMessage).filter(Boolean);
   const details: string[] = [];
@@ -292,7 +663,7 @@ function ToolbarButton({
   );
 }
 
-function Preview({ file, zoom }: { file?: FileItem; zoom: number }) {
+function Preview({ file, zoom, page = 1 }: { file?: FileItem; zoom: number; page?: number }) {
   if (!file) {
     return (
       <div className="emptyPreview">
@@ -303,9 +674,10 @@ function Preview({ file, zoom }: { file?: FileItem; zoom: number }) {
     );
   }
   if (file.kind === 'pdf') {
+    const params = new URLSearchParams({ path: file.path, page: String(page) });
     return (
       <div className="imagePreview pdfPreview">
-        <img src={`/api/preview?path=${encodeURIComponent(file.path)}`} alt={file.name} style={{ width: `${zoom}%` }} />
+        <img src={`/api/preview?${params.toString()}`} alt={file.name} style={{ width: `${zoom}%` }} />
       </div>
     );
   }
@@ -746,6 +1118,792 @@ function HistoryPanel({ processed, documents, columnsView }: { processed: FileIt
   );
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
+}
+
+function textValue(value: unknown) {
+  return value === undefined || value === null ? '' : String(value);
+}
+
+function emptyReviewLine(): Record<string, unknown> {
+  return {
+    referencia_proveedor: '',
+    articulo: '',
+    descripcion: '',
+    cantidad: '1',
+    precio: '',
+    descuento1: '',
+    iva: '21',
+    importe_origen: '',
+    seleccion_articulo: 'manual',
+  };
+}
+
+function cleanIssueText(value: unknown) {
+  const text = normalizeIncidentText(value)
+    .replace(/\s+/g, ' ')
+    .replace(/^Command failed:\s*/i, '')
+    .trim();
+  if (!text) return '';
+  if (isFileLockedIncidentText(text)) {
+    return 'El PDF está abierto o bloqueado por otro proceso.';
+  }
+  if (/^Traceback/i.test(text)) {
+    return 'Error tecnico al guardar la propuesta; revisa el log de integracion para ver la ultima linea del fallo.';
+  }
+  if (/invalid literal for int\(\)/i.test(text)) {
+    return 'La IA devolvio un campo numerico con texto; refresca y vuelve a lanzar la revision con la cabecera normalizada.';
+  }
+  if (/decimal\.ConversionSyntax|ConversionSyntax/i.test(text)) {
+    return 'Hay un campo numerico con formato no valido; revisa cantidades, precios, descuentos, IVA e importes.';
+  }
+  if (text.includes('persist_ai_importation.py') || text.includes('"cabecera"') || text.includes('"lineas"')) {
+    return 'La propuesta de IA no se pudo guardar en GDC_IMPORTACION; revisa el log de integracion para el detalle tecnico.';
+  }
+  return text.length > 260 ? `${text.slice(0, 257)}...` : text;
+}
+
+function defaultAiConfig(): AiConfig {
+  return {
+    enabled: false,
+    provider: 'openai-compatible',
+    endpoint: 'https://api.openai.com/v1/chat/completions',
+    model: 'gpt-4o-mini',
+    apiKey: '',
+    hasApiKey: false,
+    temperature: 0,
+    maxTokens: 4000,
+    timeoutSeconds: 90,
+    prompt: [
+      'Extrae de este PDF de proveedor una propuesta de entrada de almacen.',
+      'Devuelve solo JSON con cabecera, lineas y totales.',
+      'cabecera debe incluir proveedor si aparece, nombre_proveedor, cif, factura, albaran, fecha y fecha_factura.',
+      'Cada linea debe incluir referencia_proveedor, descripcion, cantidad, precio, descuento1, iva e importe_origen cuando existan.',
+      'No inventes articulos internos; deja articulo vacio si no aparece con claridad.',
+    ].join(' '),
+  };
+}
+
+function normalizeAiConfig(value?: Partial<AiConfig> | null): AiConfig {
+  const base = defaultAiConfig();
+  return {
+    ...base,
+    ...(value || {}),
+    temperature: Number(value?.temperature ?? base.temperature),
+    maxTokens: Number(value?.maxTokens ?? base.maxTokens),
+    timeoutSeconds: Number(value?.timeoutSeconds ?? base.timeoutSeconds),
+    apiKey: value?.apiKey || '',
+  };
+}
+
+function AiConfigDialog({
+  initialConfig,
+  saving,
+  error,
+  onCancel,
+  onSave,
+}: {
+  initialConfig?: AiConfig;
+  saving: boolean;
+  error: string;
+  onCancel: () => void;
+  onSave: (config: AiConfig) => void;
+}) {
+  const [draft, setDraft] = useState<AiConfig>(() => normalizeAiConfig(initialConfig));
+
+  function setField<K extends keyof AiConfig>(field: K, value: AiConfig[K]) {
+    setDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  return (
+    <div className="noticeOverlay aiConfigOverlay" role="dialog" aria-modal="true" aria-labelledby="aiConfigTitle">
+      <section className="aiConfigCard">
+        <header>
+          <div>
+            <span className="eyebrow">IA</span>
+            <h2 id="aiConfigTitle">Configurar llamada</h2>
+          </div>
+          <button className="iconOnlyButton" type="button" onClick={onCancel} title="Cerrar">
+            <X size={17} />
+          </button>
+        </header>
+        <div className="aiConfigBody">
+          <label className="checkOption aiEnableOption">
+            <input type="checkbox" checked={draft.enabled} onChange={(event) => setField('enabled', event.target.checked)} />
+            <span>
+              <strong>Activar fallback con IA</strong>
+              <small>Se usara solo si el proceso directo no deja el PDF integrado.</small>
+            </span>
+          </label>
+          <div className="fieldGrid aiConfigGrid">
+            <label>
+              <span>Proveedor</span>
+              <input value={draft.provider} onChange={(event) => setField('provider', event.target.value)} />
+            </label>
+            <label>
+              <span>Modelo</span>
+              <input value={draft.model} onChange={(event) => setField('model', event.target.value)} />
+            </label>
+            <label className="wideField">
+              <span>Endpoint</span>
+              <input value={draft.endpoint} onChange={(event) => setField('endpoint', event.target.value)} />
+            </label>
+            <label className="wideField">
+              <span>API key</span>
+              <input
+                type="password"
+                value={draft.apiKey || ''}
+                placeholder={draft.hasApiKey ? 'Clave guardada; escribe otra para cambiarla' : 'Clave del proveedor'}
+                onChange={(event) => setField('apiKey', event.target.value)}
+              />
+            </label>
+            <label>
+              <span>Temperatura</span>
+              <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(event) => setField('temperature', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Max tokens</span>
+              <input type="number" min="500" step="100" value={draft.maxTokens} onChange={(event) => setField('maxTokens', Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Timeout seg.</span>
+              <input type="number" min="10" step="5" value={draft.timeoutSeconds} onChange={(event) => setField('timeoutSeconds', Number(event.target.value))} />
+            </label>
+          </div>
+          <label className="promptField">
+            <span>Prompt</span>
+            <textarea value={draft.prompt} onChange={(event) => setField('prompt', event.target.value)} />
+          </label>
+          {error && <div className="resultBox warning"><strong>No se pudo guardar</strong><span>{error}</span></div>}
+        </div>
+        <footer>
+          <button type="button" onClick={onCancel} disabled={saving}>Cancelar</button>
+          <button type="button" onClick={() => onSave(draft)} disabled={saving}>
+            {saving ? 'Guardando...' : 'Guardar'}
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function ConfirmDialog({
+  title,
+  message,
+  confirmText = 'Aceptar',
+  cancelText = 'Cancelar',
+  variant = 'question',
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  message: string;
+  confirmText?: string;
+  cancelText?: string;
+  variant?: 'question' | 'danger';
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="noticeOverlay" role="alertdialog" aria-modal="true" aria-labelledby="confirmDialogTitle">
+      <div className={`noticeCard aiConfirmCard ${variant === 'danger' ? 'warning' : 'question'}`}>
+        <div className="noticeIcon">
+          <CircleHelp size={34} />
+        </div>
+        <div>
+          <strong id="confirmDialogTitle">{title}</strong>
+          <p>{message}</p>
+        </div>
+        <div className="confirmActions">
+          <button type="button" className="secondaryAction" onClick={onCancel}>
+            {cancelText}
+          </button>
+          <button type="button" className="primaryAction" onClick={onConfirm}>
+            {confirmText}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function validationIssues(item?: DocumentResult) {
+  const issues: string[] = [];
+  const addIssue = (message: string) => {
+    const clean = cleanIssueText(message).replace(/\.$/, '');
+    if (clean && !issues.includes(clean)) issues.push(clean);
+  };
+  if (!item) return issues;
+  const validation = item.validacion || {};
+  const hasMissingArticleSupplierIssue = (
+    Number(validation.unresolved_lines || 0) > 0
+    || item.incidencias_revision?.some((incident) => isMissingArticleIncidentText(incident.codigo) || isMissingArticleIncidentText(incident.mensaje))
+    || isMissingArticleIncidentText(item.motivo)
+    || isMissingArticleIncidentText(item.error)
+  );
+  if (validation.can_create_entry === false && hasMissingArticleSupplierIssue) {
+    return ['No se ha podido integrar porque no se ha encontrado el articulo-proveedor.'];
+  }
+  if (validation.can_create_entry === false && (
+    validation.no_lines_detected === true
+    || item.incidencias_revision?.some((incident) => isNoDetailLinesIncidentText(incident.codigo) || isNoDetailLinesIncidentText(incident.mensaje))
+    || isNoDetailLinesIncidentText(item.motivo)
+    || isNoDetailLinesIncidentText(item.error)
+  )) {
+    return ['No se ha podido integrar porque no se han detectado líneas de detalle.'];
+  }
+  const importation = item.importacion || {};
+  const persisted = importation.persistida !== false && Boolean(importation.id);
+  if (!persisted) {
+    const reason = cleanIssueText((importation as Record<string, unknown>).motivo);
+    addIssue(`Propuesta no guardada${reason ? ` (${reason})` : ''}`);
+  }
+  const unresolved = Number(validation.unresolved_lines || 0);
+  const ghostLinesAllowed = validation.ghost_lines_allowed === true
+    || String(item.cabecera?.politica_articulo_no_encontrado || '').toLowerCase() === 'fantasma';
+  if (unresolved > 0) {
+    const refs = (item.lineas || [])
+      .filter((line) => !String(line.articulo || '').trim())
+      .map((line) => String(line.referencia_proveedor || line.descripcion || '').trim())
+      .filter(Boolean);
+    const detail = refs.length ? `: ${refs.join(', ')}` : '';
+    addIssue(ghostLinesAllowed
+      ? `Se grabaran ${unresolved} linea(s) fantasma${detail}`
+      : `Faltan ${unresolved} articulo(s)${detail}`);
+  }
+  if (validation.total_reconciled === false) addIssue('El total calculado no cuadra con el documento');
+  item.incidencias_revision?.forEach((incident) => {
+    const message = cleanIssueText(incident.mensaje);
+    if (/propuesta generada por ia|revisa la propuesta de ia|pendiente de revision/i.test(message)) return;
+    if (message) addIssue(message);
+  });
+  const hasAiWarning = item.advertencias?.some((warning) => /propuesta generada por ia|revisa proveedor|precios|impuestos/i.test(String(warning || '')));
+  if (hasAiWarning) addIssue('Revisa proveedor, referencias, cantidades, precios e impuestos antes de confirmar');
+  item.advertencias?.forEach((warning) => {
+    const message = cleanIssueText(warning);
+    if (/propuesta generada por ia|revisa proveedor|esta propuesta no crea entrada/i.test(message)) return;
+    if (message) addIssue(message);
+  });
+  if (/propuesta generada por ia|ia lista para confirmar|pendiente de revision/i.test(String(item.motivo || ''))) {
+    addIssue('Pendiente de confirmar; aun no se ha creado la entrada');
+  } else if (item.motivo && !issues.some((issue) => issue.includes(String(item.motivo)))) {
+    addIssue(cleanIssueText(item.motivo));
+  }
+  if (validation.can_create_entry === false && !issues.length) {
+    addIssue('La validacion de la propuesta no permite crear la entrada');
+  }
+  return issues;
+}
+
+function unresolvedReviewLineCount(item?: DocumentResult, lines?: Array<Record<string, unknown>>) {
+  const draftLines = lines || item?.lineas || [];
+  const draftUnresolved = draftLines.filter((line) => !String(line.articulo || '').trim()).length;
+  return Math.max(Number(item?.validacion?.unresolved_lines || 0), draftUnresolved);
+}
+
+function reviewGhostPolicyAllowed(item?: DocumentResult, header?: Record<string, unknown>) {
+  const validation = item?.validacion || {};
+  const policy = String(
+    header?.politica_articulo_no_encontrado
+    || item?.cabecera?.politica_articulo_no_encontrado
+    || '',
+  ).toLowerCase();
+  return validation.ghost_lines_allowed === true || policy === 'fantasma';
+}
+
+function canConfirmWithGhostPrompt(item?: DocumentResult, lines?: Array<Record<string, unknown>>, header?: Record<string, unknown>) {
+  if (!item?.importacion?.id || item.validacion?.can_create_entry !== false) return false;
+  if (reviewGhostPolicyAllowed(item, header)) return false;
+  if (unresolvedReviewLineCount(item, lines) <= 0) return false;
+  const validation = item.validacion || {};
+  return !validation.line_limit_reached
+    && validation.pages_complete !== false
+    && validation.total_reconciled !== false
+    && validation.no_lines_detected !== true
+    && validation.evidence_low_confidence !== true;
+}
+
+function reviewDocumentKey(item: DocumentResult) {
+  const hash = String(item.importacion?.hash_sha256 || '').trim().toLowerCase();
+  if (hash) return `hash:${hash}`;
+  const pdf = String(item.pdf || '').trim().toLowerCase();
+  const albaran = String(item.cabecera?.albaran || '').trim().toLowerCase();
+  const factura = String(item.cabecera?.factura || '').trim().toLowerCase();
+  return `doc:${pdf}|${albaran}|${factura}`;
+}
+
+function dedupeReviewDocuments(items: DocumentResult[]) {
+  const result: DocumentResult[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    const key = reviewDocumentKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+function ReviewPanel({
+  runResult,
+  state,
+  onConfirmed,
+  onAskConfirm,
+}: {
+  runResult: RunResult | null;
+  state: AppState;
+  onConfirmed: (result: ConfirmResult) => void;
+  onAskConfirm: (dialog: ConfirmDialogState) => Promise<boolean>;
+}) {
+  const documents = runResult?.structuredResult?.documentos || [];
+  const [storedDocs, setStoredDocs] = useState<DocumentResult[]>([]);
+  const [loadingStored, setLoadingStored] = useState(false);
+  const [storedError, setStoredError] = useState('');
+  const [reviewSearch, setReviewSearch] = useState('');
+  const [reviewOffset, setReviewOffset] = useState(0);
+  const [storedTotal, setStoredTotal] = useState(0);
+  const [deletedImportationIds, setDeletedImportationIds] = useState<Set<string>>(new Set());
+  const reviewLimit = 25;
+  const reviewableDocuments = documents.filter((item) => (
+    item.estado === 'simulado'
+    || item.estado === 'requiere_revision'
+    || item.estado === 'propuesta'
+    || (item.importacion?.id && item.estado !== 'procesado' && item.estado !== 'documentado')
+  ));
+  const reviewDocs = dedupeReviewDocuments([
+    ...storedDocs,
+    ...reviewableDocuments,
+  ].filter((item) => !item.importacion?.id || !deletedImportationIds.has(String(item.importacion.id))));
+  const [activeIndex, setActiveIndex] = useState(0);
+  const active = reviewDocs[Math.min(activeIndex, Math.max(0, reviewDocs.length - 1))];
+  const [headerDraft, setHeaderDraft] = useState<Record<string, unknown>>({});
+  const [linesDraft, setLinesDraft] = useState<Array<Record<string, unknown>>>([]);
+  const [confirming, setConfirming] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [deletingRevision, setDeletingRevision] = useState(false);
+  const [retryingDocument, setRetryingDocument] = useState(false);
+  const [error, setError] = useState('');
+  const [savedMessage, setSavedMessage] = useState('');
+  const [reviewPage, setReviewPage] = useState(1);
+  const activeIssues = validationIssues(active);
+  const ghostPromptAvailable = canConfirmWithGhostPrompt(active, linesDraft, headerDraft);
+  const confirmBlocked = !active?.importacion?.id || (active?.validacion?.can_create_entry === false && !ghostPromptAvailable);
+  const documentRetryEnabled = Boolean(active?.importacion?.id && String(active.importacion.estado || active.estado || '').toUpperCase() === 'CONFIRMADA');
+  const deleteRevisionEnabled = Boolean(
+    active?.importacion?.id
+    && String(active.importacion.estado || active.estado || '').toUpperCase() !== 'CONFIRMADA'
+  );
+  const pageTotal = Math.max(1, Number(active?.pdf_meta?.page_count || 1));
+  const sourceFile = active?.pdf
+    ? {
+        name: active.pdf.split(/[\\/]/).pop() || active.pdf,
+        path: active.pdf,
+        relative: active.pdf,
+        extension: active.pdf.split('.').pop() ? `.${active.pdf.split('.').pop()}` : '.pdf',
+        kind: /\.pdf$/i.test(active.pdf) ? 'pdf' as FileKind : 'image' as FileKind,
+        size: 0,
+        modifiedAt: new Date().toISOString(),
+        url: `/api/file?path=${encodeURIComponent(active.pdf)}`,
+      }
+    : undefined;
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [runResult]);
+
+  useEffect(() => {
+    setLoadingStored(true);
+    const params = new URLSearchParams({
+      limit: String(reviewLimit),
+      offset: String(reviewOffset),
+      search: reviewSearch,
+    });
+    requestJson<ImportationsResult>(`/api/importations?${params.toString()}`)
+      .then((result) => {
+        setStoredDocs(result.structuredResult?.documentos || []);
+        setStoredTotal(Number(result.structuredResult?.total || 0));
+        setStoredError('');
+      })
+      .catch((err: any) => setStoredError(String(err.message || err)))
+      .finally(() => setLoadingStored(false));
+  }, [state, reviewOffset, reviewSearch]);
+
+  const activeDraftKey = [
+    active?.pdf || '',
+    active?.importacion?.id || '',
+    active?.importacion?.version || '',
+    active?.lineas?.length || 0,
+  ].join('|');
+
+  useEffect(() => {
+    setHeaderDraft(asRecord(active?.cabecera || {}));
+    setLinesDraft((active?.lineas || []).map((line) => asRecord(line)));
+    setReviewPage(1);
+    setError('');
+    setSavedMessage('');
+  }, [activeDraftKey]);
+
+  function setHeaderField(field: string, value: string) {
+    setHeaderDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function setLineField(index: number, field: string, value: string) {
+    setLinesDraft((current) => current.map((line, lineIndex) => (
+      lineIndex === index ? { ...line, [field]: value } : line
+    )));
+  }
+
+  async function confirmActive() {
+    if (!active?.importacion?.id) return;
+    let confirmHeaderDraft = headerDraft;
+    if (ghostPromptAvailable) {
+      const unresolved = unresolvedReviewLineCount(active, linesDraft);
+      const confirmed = await onAskConfirm({
+        title: 'Grabar lineas fantasma',
+        message: `No se han encontrado ${unresolved} articulo(s). ¿Desea grabarlos como lineas fantasma?`,
+        confirmText: 'Grabar fantasma',
+      });
+      if (!confirmed) return;
+      confirmHeaderDraft = {
+        ...headerDraft,
+        politica_articulo_no_encontrado: 'fantasma',
+      };
+    }
+    setConfirming(true);
+    setError('');
+    try {
+      const result = await requestJson<ConfirmResult>('/api/confirm-importation', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          propuestaId: active.importacion.id,
+          version: active.importacion.version,
+          hashSha256: active.importacion.hash_sha256,
+          cabecera: confirmHeaderDraft,
+          lineas: linesDraft,
+        }),
+      });
+      if (result.ok && active.importacion) {
+        const confirmedId = String(active.importacion.id);
+        active.importacion.estado = 'CONFIRMADA';
+        active.estado = 'confirmada';
+        setDeletedImportationIds((current) => {
+          const next = new Set(current);
+          next.add(confirmedId);
+          return next;
+        });
+        setStoredDocs((current) => current.filter((item) => String(item.importacion?.id || '') !== confirmedId));
+        setActiveIndex((index) => Math.max(0, index - 1));
+      }
+      onConfirmed(result);
+    } catch (err: any) {
+      const payload = err.payload as ConfirmResult | undefined;
+      setError(cleanIssueText(payload?.structuredResult?.error?.message || String(err.message || err)));
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  async function retryDocumentActive() {
+    if (!active?.importacion?.id) return;
+    setRetryingDocument(true);
+    setError('');
+    setSavedMessage('');
+    try {
+      const result = await requestJson<RetryDocumentResult>('/api/retry-importation-document', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          propuestaId: active.importacion.id,
+          copiarDocumentosEntradas: true,
+        }),
+      });
+      const doc = result.structuredResult?.gestion_documental as Record<string, unknown> | undefined;
+      setSavedMessage(doc?.existente ? 'Documento ya estaba archivado; no se ha duplicado.' : 'Archivo documental reintentado correctamente.');
+    } catch (err: any) {
+      const payload = err.payload as RetryDocumentResult | undefined;
+      setError(payload?.structuredResult?.error?.message || String(err.message || err));
+    } finally {
+      setRetryingDocument(false);
+    }
+  }
+
+  async function saveActive() {
+    if (!active?.importacion?.id) return;
+    setSaving(true);
+    setError('');
+    setSavedMessage('');
+    try {
+      const result = await requestJson<SaveRevisionResult>('/api/save-importation', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          propuestaId: active.importacion.id,
+          version: active.importacion.version,
+          hashSha256: active.importacion.hash_sha256,
+          cabecera: headerDraft,
+          lineas: linesDraft,
+        }),
+      });
+      if (result.structuredResult?.importacion && active.importacion) {
+        active.importacion.version = result.structuredResult.importacion.version;
+        active.importacion.estado = result.structuredResult.importacion.estado;
+      }
+      if (result.structuredResult?.validacion) active.validacion = result.structuredResult.validacion;
+      if (result.structuredResult?.totales) active.totales = result.structuredResult.totales;
+      setSavedMessage(`Revision guardada. Version ${result.structuredResult?.importacion?.version || ''}`);
+    } catch (err: any) {
+      const payload = err.payload as SaveRevisionResult | undefined;
+      setError(cleanIssueText(payload?.structuredResult?.error?.message || String(err.message || err)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteActive() {
+    if (!active?.importacion?.id) return;
+    const name = sourceFile?.name || active.importacion.id;
+    const confirmed = await onAskConfirm({
+      title: 'Borrar revisión',
+      message: `¿Desea borrar la revisión ${name}?`,
+      confirmText: 'Borrar',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    setDeletingRevision(true);
+    setError('');
+    setSavedMessage('');
+    try {
+      await requestJson<DeleteRevisionResult>('/api/delete-importation', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          propuestaId: active.importacion.id,
+          version: active.importacion.version,
+          hashSha256: active.importacion.hash_sha256,
+        }),
+      });
+      const deletedId = String(active.importacion.id);
+      setDeletedImportationIds((current) => {
+        const next = new Set(current);
+        next.add(deletedId);
+        return next;
+      });
+      setStoredDocs((current) => current.filter((item) => String(item.importacion?.id || '') !== deletedId));
+      setActiveIndex((index) => Math.max(0, index - 1));
+      setSavedMessage('Revision borrada.');
+    } catch (err: any) {
+      const payload = err.payload as DeleteRevisionResult | undefined;
+      setError(payload?.structuredResult?.error?.message || String(err.message || err));
+    } finally {
+      setDeletingRevision(false);
+    }
+  }
+
+  return (
+    <section className="panel reviewPanel">
+      <header className="panelHeader compactHeader reviewHeader">
+        <div>
+          <span className="eyebrow">Revision</span>
+          <h2>Propuestas de importacion</h2>
+        </div>
+        <span>{loadingStored ? 'cargando...' : `${reviewDocs.length} visibles · ${storedTotal} guardadas`}</span>
+      </header>
+      <div className="reviewSearchBar">
+        <label>
+          <Search size={16} />
+          <input
+            value={reviewSearch}
+            onChange={(event) => {
+              setReviewSearch(event.target.value);
+              setReviewOffset(0);
+            }}
+            placeholder="Buscar factura, albaran, ruta o propuesta"
+          />
+        </label>
+        <button type="button" disabled={reviewOffset <= 0 || loadingStored} onClick={() => setReviewOffset(Math.max(0, reviewOffset - reviewLimit))}>
+          Anterior
+        </button>
+        <button type="button" disabled={reviewOffset + reviewLimit >= storedTotal || loadingStored} onClick={() => setReviewOffset(reviewOffset + reviewLimit)}>
+          Siguiente
+        </button>
+      </div>
+      {!reviewDocs.length && loadingStored ? (
+        <div className="emptyPreview">
+          <RefreshCw size={42} />
+          <strong>Cargando propuestas de revision</strong>
+          <span>Buscando propuestas guardadas para mostrar.</span>
+        </div>
+      ) : !reviewDocs.length ? (
+        <div className="emptyPreview">
+          <CheckCircle2 size={42} />
+          <strong>Sin documentos pendientes de revision</strong>
+          <span>{storedError || 'No hay propuestas revisables guardadas ni en la ultima ejecucion.'}</span>
+        </div>
+      ) : (
+        <div className="reviewDesk">
+          <aside className="reviewList">
+            {reviewDocs.map((item, index) => {
+              const name = item.pdf?.split(/[\\/]/).pop() || `documento ${index + 1}`;
+              return (
+                <button className={index === activeIndex ? 'active' : ''} type="button" key={`${item.pdf}-${index}`} onClick={() => setActiveIndex(index)}>
+                  <strong>{name}</strong>
+                  <small>{item.estado || 'propuesta'} · {item.importacion?.id || 'sin propuesta'}</small>
+                </button>
+              );
+            })}
+          </aside>
+          <section className="reviewViewer">
+            <div className="viewerTools">
+              <span>{sourceFile?.name || 'Sin documento'}</span>
+              <span className="reviewState">{active?.estado || 'propuesta'}</span>
+              {sourceFile?.kind === 'pdf' && (
+                <div className="pageStepper">
+                  <button type="button" disabled={reviewPage <= 1} onClick={() => setReviewPage((page) => Math.max(1, page - 1))} title="Pagina anterior">
+                    <ChevronLeft size={15} />
+                  </button>
+                  <span>{reviewPage}/{pageTotal}</span>
+                  <button type="button" disabled={reviewPage >= pageTotal} onClick={() => setReviewPage((page) => Math.min(pageTotal, page + 1))} title="Pagina siguiente">
+                    <ChevronRight size={15} />
+                  </button>
+                </div>
+              )}
+              {sourceFile && (
+                <a className="smallButton" href={sourceFile.url} target="_blank" rel="noreferrer">
+                  <Maximize2 size={15} /> Abrir
+                </a>
+              )}
+            </div>
+            <Preview file={sourceFile} zoom={88} page={reviewPage} />
+          </section>
+          <section className="reviewData">
+            {storedError && <div className="resultBox warning"><strong>No se pudieron cargar propuestas</strong><span>{storedError}</span></div>}
+            <div className="reviewTiles">
+              <div className={`summaryTile ${active?.validacion?.can_create_entry === false ? 'error' : 'ok'}`}>
+                <span>Validacion</span>
+                <strong>{active?.validacion?.can_create_entry === false ? 'Revisar' : 'Confirmable'}</strong>
+              </div>
+              <div className="summaryTile article">
+                <span>Total doc.</span>
+                <strong>{String(active?.totales?.source_gross ?? '?')}</strong>
+              </div>
+              <div className="summaryTile document">
+                <span>Calculado</span>
+                <strong>{String(active?.totales?.computed_gross ?? '?')}</strong>
+              </div>
+            </div>
+            <div className="issueList">
+              {activeIssues.map((issue) => <span key={issue}>{issue}</span>)}
+            </div>
+            <div className="reviewForm">
+              <div className="fieldGrid">
+                {[
+                  ['proveedor', 'Proveedor'],
+                  ['nombre_proveedor', 'Nombre'],
+                  ['cif', 'CIF'],
+                  ['centro', 'Centro'],
+                  ['factura', 'Factura'],
+                  ['albaran', 'Albaran'],
+                  ['fecha_factura', 'Fecha factura'],
+                  ['fecha', 'Fecha entrada'],
+                ].map(([field, label]) => (
+                  <label key={field}>
+                    <span>{label}</span>
+                    <input value={textValue(headerDraft[field])} onChange={(event) => setHeaderField(field, event.target.value)} />
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="lineEditor">
+              <div className="lineEditorHeader">
+                <strong>Lineas</strong>
+                <button type="button" onClick={() => setLinesDraft((current) => [...current, emptyReviewLine()])}>
+                  <FilePlus2 size={15} /> Añadir
+                </button>
+              </div>
+              <div className="lineTable">
+                <div className="lineTableHead">
+                  <span>Ref. proveedor</span>
+                  <span>Articulo</span>
+                  <span>Descripcion</span>
+                  <span>Cant.</span>
+                  <span>Precio</span>
+                  <span>Dto.</span>
+                  <span>IVA</span>
+                  <span>Importe</span>
+                  <span>Sel.</span>
+                  <span></span>
+                </div>
+                {linesDraft.map((line, index) => {
+                  const unresolvedLine = !textValue(line.articulo).trim();
+                  return (
+                  <div className={`lineTableRow ${unresolvedLine ? 'unresolved' : ''}`} key={index}>
+                    <input value={textValue(line.referencia_proveedor)} onChange={(event) => setLineField(index, 'referencia_proveedor', event.target.value)} />
+                    <input value={textValue(line.articulo)} onChange={(event) => setLineField(index, 'articulo', event.target.value)} />
+                    <input value={textValue(line.descripcion)} onChange={(event) => setLineField(index, 'descripcion', event.target.value)} />
+                    <input value={textValue(line.cantidad)} onChange={(event) => setLineField(index, 'cantidad', event.target.value)} />
+                    <input value={textValue(line.precio)} onChange={(event) => setLineField(index, 'precio', event.target.value)} />
+                    <input value={textValue(line.descuento1)} onChange={(event) => setLineField(index, 'descuento1', event.target.value)} />
+                    <input value={textValue(line.iva)} onChange={(event) => setLineField(index, 'iva', event.target.value)} />
+                    <input value={textValue(line.importe_origen)} onChange={(event) => setLineField(index, 'importe_origen', event.target.value)} />
+                    <select value={textValue(line.article_selection || line.seleccion_articulo)} onChange={(event) => setLineField(index, 'seleccion_articulo', event.target.value)}>
+                      <option value="">Auto</option>
+                      <option value="manual">Manual</option>
+                    </select>
+                    <button type="button" title="Quitar linea" onClick={() => setLinesDraft((current) => current.filter((_, lineIndex) => lineIndex !== index))}>
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                  );
+                })}
+                {!linesDraft.length && <div className="lineTableEmpty">Sin lineas detectadas.</div>}
+              </div>
+            </div>
+            <div className="reviewActions">
+              <button
+                type="button"
+                disabled={!active?.importacion?.id || saving || confirming || retryingDocument || deletingRevision}
+                onClick={() => saveActive()}
+              >
+                {saving ? 'Guardando...' : 'Guardar revisión'}
+              </button>
+              <button
+                type="button"
+                disabled={confirmBlocked || saving || confirming || retryingDocument || deletingRevision}
+                title={confirmBlocked ? activeIssues[0] || 'No hay propuesta persistida confirmable' : 'Confirmar propuesta'}
+                onClick={() => confirmActive()}
+              >
+                {confirming ? 'Confirmando...' : 'Confirmar propuesta'}
+              </button>
+              <button
+                type="button"
+                disabled={!documentRetryEnabled || saving || confirming || retryingDocument || deletingRevision}
+                title={documentRetryEnabled ? 'Reintentar archivo documental' : 'Disponible tras confirmar la propuesta'}
+                onClick={() => retryDocumentActive()}
+              >
+                {retryingDocument ? 'Reintentando...' : 'Reintentar archivo'}
+              </button>
+              <button
+                type="button"
+                className="dangerAction"
+                disabled={!deleteRevisionEnabled || saving || confirming || retryingDocument || deletingRevision}
+                title={deleteRevisionEnabled ? 'Borrar datos de revision' : 'No se pueden borrar propuestas confirmadas'}
+                onClick={() => deleteActive()}
+              >
+                {deletingRevision ? 'Borrando...' : 'Borrar revisión'}
+              </button>
+              <small>{active?.importacion?.id ? `Propuesta ${active.importacion.id} · v${active.importacion.version || '?'}` : 'Sin propuesta persistida'}</small>
+            </div>
+            {savedMessage && <div className="resultBox ok"><strong>Guardado</strong><span>{savedMessage}</span></div>}
+            {error && <div className="resultBox warning"><strong>No se pudo confirmar</strong><span>{error}</span></div>}
+          </section>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
   const [activeFilePath, setActiveFilePath] = useState('');
@@ -755,7 +1913,16 @@ export default function App() {
     updatePrices: false,
     updateOnlyIfUp: false,
     ghostLines: false,
+    aiFallback: false,
   });
+  const [aiConfig, setAiConfig] = useState<AiConfig>(defaultAiConfig());
+  const [showAiConfig, setShowAiConfig] = useState(false);
+  const [savingAiConfig, setSavingAiConfig] = useState(false);
+  const [aiConfigError, setAiConfigError] = useState('');
+  const [showAiFallbackConfirm, setShowAiFallbackConfirm] = useState(false);
+  const aiFallbackConfirmResolver = useRef<((value: boolean) => void) | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const confirmDialogResolver = useRef<((value: boolean) => void) | null>(null);
   const [activeLog, setActiveLog] = useState<LogItem | undefined>();
   const [search, setSearch] = useState('');
   const [running, setRunning] = useState(false);
@@ -763,7 +1930,7 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [zoom, setZoom] = useState(82);
   const [columnsView, setColumnsView] = useState(false);
-  const [mainTab, setMainTab] = useState<'principal' | 'logs' | 'archivo'>('principal');
+  const [mainTab, setMainTab] = useState<'principal' | 'revision' | 'logs' | 'archivo'>('principal');
   const [runResult, setRunResult] = useState<RunResult | null>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -772,6 +1939,10 @@ export default function App() {
   async function refresh() {
     const next = await requestJson<AppState>('/api/state');
     setState(next);
+    if (next.aiConfig) {
+      const normalized = normalizeAiConfig(next.aiConfig);
+      setAiConfig(normalized);
+    }
     setActiveFilePath((current) => current || next.pending[0]?.path || '');
     setActiveLog((current) => current || next.logs[0]);
     setSelectedNames((current) => {
@@ -849,7 +2020,13 @@ export default function App() {
       return;
     }
     const label = names.length === 1 ? `el fichero "${names[0]}"` : `${names.length} ficheros`;
-    if (!window.confirm(`¿Desea borrar ${label} de Pendientes?`)) return;
+    const confirmed = await askConfirm({
+      title: 'Borrar pendientes',
+      message: `¿Desea borrar ${label} de Pendientes?`,
+      confirmText: 'Borrar',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
     await runPendingAction('/api/delete', (result) => `${result.deleted?.length || 0} fichero(s) eliminado(s)`);
   }
 
@@ -896,6 +2073,32 @@ export default function App() {
     });
   }
 
+  function askAiFallbackConfirmation() {
+    setShowAiFallbackConfirm(true);
+    return new Promise<boolean>((resolve) => {
+      aiFallbackConfirmResolver.current = resolve;
+    });
+  }
+
+  function resolveAiFallbackConfirmation(value: boolean) {
+    aiFallbackConfirmResolver.current?.(value);
+    aiFallbackConfirmResolver.current = null;
+    setShowAiFallbackConfirm(false);
+  }
+
+  function askConfirm(dialog: ConfirmDialogState) {
+    setConfirmDialog(dialog);
+    return new Promise<boolean>((resolve) => {
+      confirmDialogResolver.current = resolve;
+    });
+  }
+
+  function resolveConfirmDialog(value: boolean) {
+    confirmDialogResolver.current?.(value);
+    confirmDialogResolver.current = null;
+    setConfirmDialog(null);
+  }
+
   async function runIntegration() {
     if (!state) return;
     if (!selectedCount) {
@@ -911,16 +2114,19 @@ export default function App() {
     setRunResult(null);
     const activeMode = modeFromOptions(processOptions);
     const names = [...selectedNames];
-    try {
-      const result = await requestJson<RunResult>('/api/run', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ mode: activeMode, selectedNames: names }),
-      });
+    const applyRunResult = (result: RunResult) => {
       setRunResult(result);
       if (result.state) setState(result.state);
       if (result.latestLog) setActiveLog(result.latestLog);
-      if (runHasIncidents(result)) {
+      if (Number(result.structuredResult?.requiere_revision || 0) > 0 || runHasConfirmableProposals(result)) setMainTab('revision');
+      if (runHasConfirmableProposals(result)) {
+        setNotice({
+          title: 'Entrada no creada',
+          message: 'No se ha creado la entrada de almacen porque este documento viene de IA y queda como propuesta revisable. Para integrarlo, confirma la propuesta en la pestaña Revision.',
+          details: integrationReport(result),
+          variant: 'info',
+        });
+      } else if (runHasIncidents(result)) {
         setNotice({
           title: 'Integracion con incidencias',
           message: incidentMessage(result),
@@ -937,18 +2143,71 @@ export default function App() {
       }
       setSelectedNames(new Set());
       setActiveFilePath(result.state?.pending[0]?.path || '');
+    };
+    const maybeAskForAi = async (result: RunResult) => {
+      if (!processOptions.aiFallback || !runHasIncidents(result)) return result;
+      const wantsAi = await askAiFallbackConfirmation();
+      if (!wantsAi) return result;
+      setMessage('Consultando IA para documentos pendientes...');
+      const aiResult = await requestJson<RunResult>('/api/ai-fallback', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ result, missingPolicy: state.modes[activeMode]?.missingPolicy || 'detener' }),
+      });
+      return aiResult;
+    };
+    const runSelectedMode = (mode: string) => requestJson<RunResult>('/api/run', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode, selectedNames: names, aiFallback: false }),
+    });
+    const maybeAskForGhostLines = async (result: RunResult) => {
+      if (
+        processOptions.documentOnly
+        || processOptions.ghostLines
+        || activeMode === 'fantasma'
+        || activeMode === 'fantasma_sube'
+        || runHasTotalMismatchIncident(result)
+        || !runHasMissingArticleIncident(result)
+      ) {
+        return result;
+      }
+      const confirmed = await askConfirm({
+        title: 'Grabar lineas fantasma',
+        message: 'No se han encontrado uno o varios articulos. ¿Desea grabarlos como lineas fantasma?',
+        confirmText: 'Grabar fantasma',
+      });
+      if (!confirmed) return result;
+      setMessage('Integrando con lineas fantasma...');
+      const ghostMode = processOptions.updateOnlyIfUp ? 'fantasma_sube' : 'fantasma';
+      return runSelectedMode(ghostMode);
+    };
+    try {
+      const result = await runSelectedMode(activeMode);
+      const reviewedResult = await maybeAskForAi(result);
+      applyRunResult(await maybeAskForGhostLines(reviewedResult));
     } catch (err: any) {
       const payload = err.payload as RunResult | undefined;
       if (payload) {
-        setRunResult(payload);
-        if (payload.state) setState(payload.state);
-        if (payload.latestLog) setActiveLog(payload.latestLog);
-        setNotice({
-          title: 'Integracion con incidencias',
-          message: payload.latestLog?.cause || payload.latestLog?.summaryLine || payload.stderr || 'La integracion ha finalizado con incidencias.',
-          details: integrationReport(payload),
-          variant: 'warning',
-        });
+        try {
+          const reviewedPayload = await maybeAskForAi(payload);
+          applyRunResult(await maybeAskForGhostLines(reviewedPayload));
+        } catch (aiErr: any) {
+          const aiPayload = aiErr.payload as RunResult | undefined;
+          if (aiPayload) applyRunResult(aiPayload);
+          else {
+            setRunResult(payload);
+            if (payload.state) setState(payload.state);
+            if (payload.latestLog) setActiveLog(payload.latestLog);
+            if (Number(payload.structuredResult?.requiere_revision || 0) > 0) setMainTab('revision');
+            setNotice({
+              title: 'Integracion con incidencias',
+              message: String(aiErr.message || aiErr),
+              details: integrationReport(payload),
+              variant: 'warning',
+            });
+          }
+        }
       } else {
         const message = String(err.message || err);
         setError(message);
@@ -961,6 +2220,43 @@ export default function App() {
     } finally {
       setRunning(false);
     }
+  }
+
+  async function saveAiConfig(config: AiConfig) {
+    setSavingAiConfig(true);
+    setAiConfigError('');
+    try {
+      const result = await requestJson<{ ok: boolean; aiConfig: AiConfig }>('/api/ai-config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(config),
+      });
+      const normalized = normalizeAiConfig(result.aiConfig);
+      setAiConfig(normalized);
+      setShowAiConfig(false);
+      setMessage('Configuracion de IA guardada');
+    } catch (err: any) {
+      setAiConfigError(String(err.message || err));
+    } finally {
+      setSavingAiConfig(false);
+    }
+  }
+
+  function applyConfirmResult(result: ConfirmResult) {
+    if (result.state) setState(result.state);
+    const pendingDeleted = result.structuredResult?.pendiente_borrado as Record<string, unknown> | undefined;
+    const deletedSuffix = pendingDeleted?.borrado === true
+      ? ' PDF eliminado de Pendientes.'
+      : result.ok
+        ? ' Atención: no consta borrado del PDF de Pendientes.'
+        : '';
+    setNotice({
+      title: result.ok ? 'Propuesta confirmada' : 'Confirmacion con incidencias',
+      message: result.ok
+        ? `Entrada creada ${result.structuredResult?.documento?.ejercicio || ''}-${result.structuredResult?.documento?.serie || ''}-${result.structuredResult?.documento?.numero || ''}.${deletedSuffix}`
+        : result.structuredResult?.error?.message || result.stderr || 'No se pudo confirmar la propuesta.',
+      variant: result.ok ? 'info' : 'warning',
+    });
   }
 
   if (!state) {
@@ -1001,6 +2297,9 @@ export default function App() {
         <button className={mainTab === 'principal' ? 'active' : ''} type="button" onClick={() => setMainTab('principal')}>
           Principal
         </button>
+        <button className={mainTab === 'revision' ? 'active' : ''} type="button" onClick={() => setMainTab('revision')}>
+          Revisión
+        </button>
         <button className={mainTab === 'logs' ? 'active' : ''} type="button" onClick={() => setMainTab('logs')}>
           Logs de integracion
         </button>
@@ -1017,6 +2316,7 @@ export default function App() {
           <ToolbarButton icon={<Trash2 size={32} />} label="Eliminar" disabled={!activeFile} onClick={() => deletePendingAction().catch((err) => setError(String(err.message || err)))} />
           <ToolbarButton icon={<FilePlus2 size={32} />} label="Generar PDF" disabled={!activeFile} onClick={() => runPendingAction('/api/generate-pdf', (result) => `${result.generated?.length || 0} PDF(s) generado(s)`).catch((err) => setError(String(err.message || err)))} />
           <ToolbarButton icon={<Archive size={32} />} label="Archivar" disabled={!activeFile} onClick={() => runPendingAction('/api/archive', (result) => `${result.archived?.length || 0} fichero(s) archivado(s)`).catch((err) => setError(String(err.message || err)))} />
+          <ToolbarButton icon={<Settings size={32} />} label="Configurar IA" active={showAiConfig} onClick={() => setShowAiConfig(true)} />
         </div>
         <div className="toolGroup viewGroup">
           <ToolbarButton icon={<ImageIcon size={32} />} label="Iconos Grandes" active={!columnsView} onClick={() => setColumnsView(false)} />
@@ -1113,6 +2413,18 @@ export default function App() {
                   <small>Continua si falta la ficha de compra.</small>
                 </span>
               </label>
+              <label className="checkOption">
+                <input
+                  type="checkbox"
+                  checked={processOptions.aiFallback}
+                  disabled={processOptions.documentOnly}
+                  onChange={(event) => setProcessOptions((current) => ({ ...current, aiFallback: event.target.checked }))}
+                />
+                <span>
+                  <strong>Preguntar IA si no integra</strong>
+                  <small>{aiConfig.enabled ? `${aiConfig.provider} · ${aiConfig.model}` : 'Configura la llamada antes de procesar.'}</small>
+                </span>
+              </label>
             </div>
             <div className="selectionSummary">
               <strong>{selectedCount || state.pending.length}</strong>
@@ -1187,6 +2499,12 @@ export default function App() {
         </section>
       )}
 
+      {mainTab === 'revision' && (
+        <section className="tabPage">
+          <ReviewPanel runResult={runResult} state={state} onConfirmed={applyConfirmResult} onAskConfirm={askConfirm} />
+        </section>
+      )}
+
       {mainTab === 'archivo' && (
         <section className="tabPage">
           <HistoryPanel processed={state.processed} documents={state.documents} columnsView={columnsView} />
@@ -1215,6 +2533,34 @@ export default function App() {
             </button>
           </div>
         </div>
+      )}
+
+      {showAiConfig && (
+        <AiConfigDialog
+          initialConfig={aiConfig}
+          saving={savingAiConfig}
+          error={aiConfigError}
+          onCancel={() => setShowAiConfig(false)}
+          onSave={saveAiConfig}
+        />
+      )}
+
+      {showAiFallbackConfirm && (
+        <ConfirmDialog
+          title="Usar IA para esta integracion"
+          message="La integracion directa ha dejado incidencias. ¿Desea intentar extraer los documentos pendientes con IA?"
+          confirmText="Usar IA"
+          onCancel={() => resolveAiFallbackConfirmation(false)}
+          onConfirm={() => resolveAiFallbackConfirmation(true)}
+        />
+      )}
+
+      {confirmDialog && (
+        <ConfirmDialog
+          {...confirmDialog}
+          onCancel={() => resolveConfirmDialog(false)}
+          onConfirm={() => resolveConfirmDialog(true)}
+        />
       )}
 
       {dragging && (

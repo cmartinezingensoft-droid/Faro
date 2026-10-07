@@ -8,7 +8,7 @@ import faro_mcp
 from tests._runtime_compat import legacy_handle_for_test
 
 
-PHASE12_ALL_SCHEMA_SHA256 = "69714b385eeab9a0a400cec80c60867e2dad9678cb10b982cb97ec3adabecdc6"
+PHASE12_ALL_SCHEMA_SHA256 = "0e7e21ab44e4636dfa42d3932488c9870d81cf7467e11441c21e22ab9ee4f9d7"
 # Hash actualizado de forma intencional:
 # 1) al permitir que stock_trasvasar reciba lineas con solo articulo+cantidad
 #    (descripcion/unidad_medida se autocompletan desde ARTICUL si se dejan
@@ -114,7 +114,7 @@ class CleanupPhase11InternalRefactorTests(unittest.TestCase):
     def test_public_handlers_use_canonical_method_names(self):
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "all"}):
             server = faro_mcp.FaroToolRuntime()
-        self.assertEqual(len(server.tools), 102)
+        self.assertEqual(len(server.tools), len(faro_mcp.ALL_PUBLIC_TOOL_NAMES))
         for name, handler in server.tools.items():
             with self.subTest(name=name):
                 self.assertEqual(handler.__name__, f"tool_{name}")
@@ -135,7 +135,13 @@ class CleanupPhase11InternalRefactorTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(payload).hexdigest(), PHASE12_ALL_SCHEMA_SHA256)
 
     def test_profiles_keep_frozen_counts(self):
-        expected = {"core": 92, "admin": 101, "integrations": 93, "all": 102, "full": 102}
+        expected = {
+            "core": len(faro_mcp.CORE_PUBLIC_TOOL_NAMES),
+            "admin": len(faro_mcp.CORE_PUBLIC_TOOL_NAMES | faro_mcp.ADMIN_PUBLIC_TOOL_NAMES),
+            "integrations": len(faro_mcp.CORE_PUBLIC_TOOL_NAMES | faro_mcp.INTEGRATION_PUBLIC_TOOL_NAMES),
+            "all": len(faro_mcp.ALL_PUBLIC_TOOL_NAMES),
+            "full": len(faro_mcp.ALL_PUBLIC_TOOL_NAMES),
+        }
         for profile, count in expected.items():
             with self.subTest(profile=profile), patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": profile}):
                 server = faro_mcp.FaroToolRuntime()

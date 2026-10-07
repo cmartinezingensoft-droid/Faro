@@ -36,9 +36,9 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
             | faro_mcp.CRITICAL_TOOL_NAMES
         )
         self.assertEqual(union, faro_mcp.ALL_PUBLIC_TOOL_NAMES)
-        self.assertEqual(len(faro_mcp.READ_ONLY_TOOL_NAMES), 69)
-        self.assertEqual(len(faro_mcp.WRITE_TOOL_NAMES), 16)
-        self.assertEqual(len(faro_mcp.CRITICAL_TOOL_NAMES), 17)
+        self.assertEqual(len(faro_mcp.READ_ONLY_TOOL_NAMES), 70)
+        self.assertEqual(len(faro_mcp.WRITE_TOOL_NAMES), 17)
+        self.assertEqual(len(faro_mcp.CRITICAL_TOOL_NAMES), 21)
         self.assertFalse(faro_mcp.READ_ONLY_TOOL_NAMES & faro_mcp.WRITE_TOOL_NAMES)
         self.assertFalse(faro_mcp.READ_ONLY_TOOL_NAMES & faro_mcp.CRITICAL_TOOL_NAMES)
         self.assertFalse(faro_mcp.WRITE_TOOL_NAMES & faro_mcp.CRITICAL_TOOL_NAMES)
@@ -210,7 +210,7 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
         ).encode("utf-8")
         self.assertEqual(
             hashlib.sha256(payload).hexdigest(),
-            "69714b385eeab9a0a400cec80c60867e2dad9678cb10b982cb97ec3adabecdc6",
+            "0e7e21ab44e4636dfa42d3932488c9870d81cf7467e11441c21e22ab9ee4f9d7",
         )
 
     def test_server_version(self):

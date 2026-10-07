@@ -12,7 +12,7 @@ class CleanupPhase12ContractV2Tests(unittest.TestCase):
         return next(item for item in faro_mcp.tool_definitions(profile) if item["name"] == name)
 
     def test_profiles_and_tool_names_are_unchanged(self):
-        expected = {"core": 87, "admin": 96, "integrations": 88, "all": 97, "full": 97}
+        expected = {"core": 98, "admin": 107, "integrations": 99, "all": 108, "full": 108}
         for profile, count in expected.items():
             with self.subTest(profile=profile):
                 self.assertEqual(len(faro_mcp.tool_definitions(profile)), count)
