@@ -850,7 +850,7 @@ button { cursor: pointer; }
 
 .reviewDesk {
   display: grid;
-  grid-template-columns: 150px minmax(360px, 1fr) minmax(680px, 760px);
+  grid-template-columns: 150px minmax(380px, 1fr) minmax(720px, 820px);
   min-height: 0;
 }
 
@@ -946,10 +946,10 @@ button { cursor: pointer; }
 
 .reviewData {
   display: grid;
-  grid-template-rows: auto auto auto minmax(180px, 1fr) auto auto;
+  grid-template-rows: auto auto auto minmax(220px, 1fr) auto;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
   padding: 10px;
   background: #fbfdff;
   font-size: 11px;
@@ -976,7 +976,9 @@ button { cursor: pointer; }
 .issueList {
   display: grid;
   gap: 6px;
+  max-height: 124px;
   min-height: 0;
+  overflow: auto;
   margin-bottom: 8px;
 }
 
@@ -994,26 +996,37 @@ button { cursor: pointer; }
 
 .reviewForm {
   display: grid;
+  gap: 10px;
   margin-bottom: 8px;
 }
 
 .fieldGrid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  align-items: end;
 }
 
 .fieldGrid label {
   display: grid;
-  gap: 4px;
+  grid-template-rows: minmax(24px, auto) 30px;
+  gap: 5px;
   min-width: 0;
   color: #475569;
   font-size: 9px;
   font-weight: 900;
+  line-height: 1.15;
   text-transform: uppercase;
 }
 
+.fieldGrid label span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .fieldGrid input,
+.fieldGrid select,
 .lineTable input,
 .lineTable select {
   width: 100%;
@@ -1030,16 +1043,47 @@ button { cursor: pointer; }
 }
 
 .fieldGrid input:focus,
+.fieldGrid select:focus,
 .lineTable input:focus,
 .lineTable select:focus {
   border-color: #f7c679;
   box-shadow: 0 0 0 3px rgba(242,140,0,.12);
 }
 
+.reviewForm > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid #d8e2ee;
+  border-radius: 8px;
+  background: #fff;
+  color: #334155;
+  line-height: 1.25;
+}
+
+.reviewForm > label input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+}
+
+.reviewForm > p {
+  margin: 0;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: #fff8ec;
+  color: #7c3f00;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
 .lineEditor {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  min-height: 0;
+  min-height: 220px;
   margin-bottom: 8px;
   overflow: hidden;
 }
@@ -1884,6 +1928,11 @@ button { cursor: pointer; }
   font-weight: 400;
 }
 
+.noticeEntryText {
+  color: #1d4ed8;
+  font-weight: 900;
+}
+
 .noticeDetails {
   display: grid;
   gap: 5px;
@@ -1942,12 +1991,22 @@ button { cursor: pointer; }
   color: #475569;
 }
 
+.noticeCard .confirmActions .dangerAction {
+  border-color: #fca5a5;
+  background: #fff5f5;
+  color: #b91c1c;
+}
+
 .noticeCard .confirmActions .primaryAction:hover {
   background: #ffe8bd;
 }
 
 .noticeCard .confirmActions .secondaryAction:hover {
   background: #f8fafc;
+}
+
+.noticeCard .confirmActions .dangerAction:hover {
+  background: #fee2e2;
 }
 
 @keyframes noticeFade {

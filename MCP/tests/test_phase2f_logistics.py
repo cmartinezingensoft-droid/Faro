@@ -1,6 +1,7 @@
 import os
 import tempfile
-import os
+import re
+import weakref
 import sys
 import unittest
 import base64
@@ -79,6 +80,10 @@ class PurchaseEntryDb:
             db_driver="odbc", db_path="", odbc_dsn="faro", db_user="u", db_password="p",
             empresa=1, centro=7, usuario="test",
         )
+        temporary = tempfile.mkdtemp(prefix="faro-test-")
+        import shutil
+        weakref.finalize(self, shutil.rmtree, temporary, True)
+        self.settings.main_dir = temporary
         self.supplier_article = supplier_article
         self.executed = []
         self.provider_queries = []
@@ -97,6 +102,10 @@ class PurchaseEntryDb:
     def fetch_one(self, sql, params=()):
         u = " ".join(sql.upper().split())
         if "FROM GDC_IMPORTACION" in u:
+            if "COUNT(*)" in u:
+                return {"TOTAL": int(self.importation_row is not None)}
+            if self.importation_row and "GDI_HASH=?" in u and params[-1] != self.importation_row.get("GDI_HASH"):
+                return None
             return dict(self.importation_row) if self.importation_row else None
         if "FROM DOCUMENTO" in u and "DOC_IDKRONOS" in u:
             return dict(self.existing_entry_document) if self.existing_entry_document else None
@@ -154,6 +163,9 @@ class PurchaseEntryDb:
     def fetch_all(self, sql, params=()):
         self.fetch_all_calls.append((sql, params))
         u = " ".join(sql.upper().split())
+        if "FROM PROVEE" in u:
+            row = self.fetch_one(sql, params)
+            return [row] if row else []
         if "FROM GDC_IMPORTACION" in u and self.importation_row:
             return [dict(self.importation_row)]
         return []
@@ -161,15 +173,35 @@ class PurchaseEntryDb:
     def execute(self, sql, params=()):
         normalized_sql = " ".join(sql.split())
         self.executed.append((normalized_sql, params))
+        if normalized_sql.startswith("INSERT INTO GDC_IMPORTACION ("):
+            columns = normalized_sql.split("(", 1)[1].split(")", 1)[0].split(",")
+            self.importation_row = dict(zip((column.strip() for column in columns), params))
         if normalized_sql.startswith("UPDATE GDC_IMPORTACION SET") and self.importation_row:
-            self.importation_row["GDI_ESTADO"] = params[0]
-            self.importation_row["GDI_VERSION"] = params[1]
-            if "GDI_PROPUESTA" in normalized_sql:
-                self.importation_row["GDI_PROPUESTA"] = params[5]
+            assignments = normalized_sql.split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+            values = iter(params)
+            for column, expression in re.findall(r"(GDI_\w+)\s*=\s*(\?|'[^']*')", assignments):
+                self.importation_row[column] = next(values) if expression == "?" else expression.strip("'")
         if normalized_sql.startswith("DELETE FROM GDC_IMPORTACION") and self.importation_row:
             self.importation_row = None
         if normalized_sql.startswith("INSERT INTO DETMOVM"):
             self.detmovm_lines.append(params)
+
+    def execute_affected(self, sql, params=()):
+        row = self.importation_row
+        if not row:
+            return 0
+        before, where = sql.upper().split(" WHERE ", 1)
+        values = iter(params[before.count("?"):])
+        for column in re.findall(r"(GDI_\w+)\s*=\s*\?", where):
+            if row.get(column) != next(values):
+                return 0
+        for column, value in re.findall(r"(GDI_\w+)\s*=\s*'([^']*)'", where):
+            if row.get(column) != value:
+                return 0
+        if "GDI_ESTADO IN ('PROPUESTA', 'REVISADA')" in where and row.get("GDI_ESTADO") not in {"PROPUESTA", "REVISADA"}:
+            return 0
+        self.execute(sql, params)
+        return 1
 
     def commit(self):
         self.commits += 1
@@ -295,7 +327,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertIn("entrada_almacen_propuestas_listar", core.tools)
         self.assertIn("orden_compra_cerrar", core.tools)
         self.assertNotIn("integracion_coinfer_stock", core.tools)
-        self.assertEqual(len(core.tools), 98)
+        self.assertEqual(len(core.tools), 99)
         self.assertFalse(any(name.startswith("datasnap_") for name in core.tools))
         with patch.dict(os.environ, {"FARO_MCP_TOOL_PROFILE": "full"}):
             full = faro_mcp.FaroToolRuntime()
@@ -325,7 +357,9 @@ class Phase2FLogisticsTests(unittest.TestCase):
             db.settings.documents_dir = "Documentos"
             svc = faro_mcp.FaroPhase1Service(db)
             svc.purchase_entry_pdf_proposal = lambda args: {
-                "pdf": {"source": str(pdf_path)},
+                "hash_sha256": hashlib.sha256(Path(args["ruta_pdf"]).read_bytes()).hexdigest(),
+                "pdf": {"origen": args["ruta_pdf"]},
+                "totales": {"source_gross": "9.68"},
                 "cabecera": {"proveedor": 44, "fecha": "2026-09-15"},
                 "lineas": [{"articulo": "A1", "cantidad": "1", "precio": "8", "resuelto": True}],
                 "advertencias": [],
@@ -357,6 +391,9 @@ class Phase2FLogisticsTests(unittest.TestCase):
             db.settings.main_dir = tmp
             svc = faro_mcp.FaroPhase1Service(db)
             svc.purchase_entry_pdf_proposal = lambda args: {
+                "hash_sha256": hashlib.sha256(Path(args["ruta_pdf"]).read_bytes()).hexdigest(),
+                "pdf": {"origen": args["ruta_pdf"]},
+                "totales": {"source_gross": "9.68"},
                 "cabecera": {"proveedor": 44, "albaran": "ALB-1", "factura": ""},
                 "lineas": [{"articulo": "A1", "cantidad": "1", "precio": "8", "resuelto": True}],
             }
@@ -397,6 +434,9 @@ class Phase2FLogisticsTests(unittest.TestCase):
             db.settings.main_dir = tmp
             svc = faro_mcp.FaroPhase1Service(db)
             svc.purchase_entry_pdf_proposal = lambda args: {
+                "hash_sha256": hashlib.sha256(Path(args["ruta_pdf"]).read_bytes()).hexdigest(),
+                "pdf": {"origen": args["ruta_pdf"]},
+                "totales": {"source_gross": "9.68"},
                 "cabecera": {"proveedor": 44, "albaran": "ALB-1", "factura": ""},
                 "lineas": [{"articulo": "A1", "cantidad": "1", "precio": "8", "resuelto": True}],
             }
@@ -461,11 +501,14 @@ class Phase2FLogisticsTests(unittest.TestCase):
             db.settings.main_dir = tmp
             svc = faro_mcp.FaroPhase1Service(db)
             svc.purchase_entry_pdf_proposal = lambda args: {
+                "hash_sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+                "pdf": {"origen": str(pdf_path)},
                 "_texto_extraido_documento": (
                     "FACTURA DE PROVEEDOR Proveedor 44 CIF B44 FAC-1 REF-A1 Articulo uno "
                     "Base imponible 8 IVA 21 Total documento 9.68"
                 ),
                 "cabecera": {
+                    "solo_gestion_documental": True,
                     "proveedor": 44,
                     "cif": "B44",
                     "factura": "FAC-1",
@@ -669,7 +712,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
-            "CIF: B44\nFactura Nº FAC-77\nAlbarán Nº ALB-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21",
+            "CIF: B44\nFactura Nº FAC-77\nAlbarán Nº ALB-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
 
@@ -683,6 +726,31 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertEqual(result["lineas"][0]["articulo"], "A1")
         self.assertTrue(result["lineas"][0]["resuelto"])
         self.assertIn("CABDOCM_UDM.pas", result["validacion_fuentes"]["cabecera_y_totales"])
+
+    def test_purchase_entry_pdf_preview_extracts_standard_table_with_percent_columns(self):
+        db = PurchaseEntryDb()
+        svc = faro_mcp.FaroPhase1Service(db)
+        svc._purchase_entry_pdf_text = lambda args: (
+            "CIF: B44\nFactura: ST-2026-1007-002\nAlbaran: ALB-ST-26042\n"
+            "Ref. proveedor Articulo Descripcion Cant. Precio Dto. Base IVA Importe\n"
+            "0-90-948 0-90-948 LLAVE AJUSTABLE STANLEY 5 9,31 0% 46,55 21% 56,33\n"
+            "BIMATERIAL 200MM\n"
+            "1-17-754 1-17-754 CORTAVARILLAS MANGO TUBULAR 1 79,00 36% 50,56 21% 61,18\n"
+            "900MM / 36\"\n"
+            "Base imponible 97,11\nIVA 21% 20,40\nTOTAL FACTURA 117,51",
+            {"origen": "factura.pdf", "bytes": 1234},
+        )
+
+        result = svc.purchase_entry_pdf_proposal({"proveedor": 44, "centro": 7})
+
+        self.assertEqual(result["cabecera"]["factura"], "ST-2026-1007-002")
+        self.assertEqual([line["referencia_proveedor"] for line in result["lineas"]], ["0-90-948", "1-17-754"])
+        self.assertEqual(result["lineas"][0]["descripcion"], "LLAVE AJUSTABLE STANLEY BIMATERIAL 200MM")
+        self.assertEqual(result["lineas"][1]["descripcion"], "CORTAVARILLAS MANGO TUBULAR 900MM / 36\"")
+        self.assertEqual(result["lineas"][0]["importe_origen"], "46.55")
+        self.assertEqual(result["lineas"][1]["descuento1"], "36")
+        self.assertTrue(result["validacion"]["total_reconciled"])
+        self.assertFalse(result["validacion"]["no_lines_detected"])
 
     def test_purchase_entry_pdf_preview_resolves_internal_article_code_without_supplier_reference(self):
         db = PurchaseEntryDb(supplier_article=False)
@@ -715,12 +783,10 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertTrue(result["lineas"][0]["resuelto"])
         self.assertNotIn("unresolved_article", result["advertencias"])
 
-    def test_purchase_entry_pdf_preview_ignores_payment_footer_and_dedupes_layout_line(self):
+    def test_purchase_entry_pdf_preview_ignores_payment_footer_in_layout_text(self):
         db = PurchaseEntryDb(supplier_article=False)
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
-            "DESCRIPCION CANTIDADARTICULO IMPORTE\n"
-            "CERRADURA EMBUT.N 2000 55X30 TESA 37,501282D55 37,50001\n"
             "ARTICULO DESCRIPCION CANTIDAD PRECIO %DTO. IMPORTE\n"
             "1282D55 CERRADURA EMBUT.N 2000 55X30 TESA 1 37,5000 37,50\n"
             "Forma Pago: PAGARE 180 DIAS F/FTRA. CCC ES98 0049 1861 11 2010070072",
@@ -738,6 +804,13 @@ class Phase2FLogisticsTests(unittest.TestCase):
 
     def test_purchase_entry_pdf_preview_extracts_faren_columnar_ocr_rows(self):
         db = PurchaseEntryDb(supplier_article=False)
+        original_fetch = db.fetch_one
+        def faren_provider(sql, params=()):
+            row = original_fetch(sql, params)
+            if row and "FROM PROVEE" in sql.upper():
+                row["PRO_CIF"] = "A25142488"
+            return row
+        db.fetch_one = faren_provider
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
             "BANCO CODIGO IGE500SP 977003 TARIC COD. NOMBRE DEL ARTICULO UDAD "
@@ -759,7 +832,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertEqual(result["totales"]["computed_gross"], "256.57")
         self.assertTrue(result["totales"]["reconciled"])
 
-    def test_purchase_entry_pdf_preview_ignores_iban_and_prefers_layout_duplicate_rows(self):
+    def test_purchase_entry_pdf_preview_ignores_iban_and_preserves_layout_order(self):
         db = PurchaseEntryDb(supplier_article=False)
         svc = faro_mcp.FaroPhase1Service(db)
         svc._internal_article_for_entry = lambda codart: None if codart == "62794" else {
@@ -771,9 +844,6 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "FACTURA\n"
             "TRANSFERENCIA BANCARIA 60 DIAS\n"
             "ES42 2100 4337 8302 0008 5262\n"
-            "37741 ARCHIVADOR JASPEADO FOLIO SIN RADO LIDERPA  20,10 10,00  2,01  21,00\n"
-            "DSG26401516 C.250 SOBRES ADHES. PACKING-LIST 240x140 (ext.)  57,54 3,00  19,18  21,00\n"
-            "33669 PIZ.BLANCA LAC. MAG MARCO ALUM 150X100 CM Q-  145,01 1,00  145,01  21,00\n"
             "Art�culo Descripci�n Unidades Precio Dto %IVA Importe\n"
             "37741 ARCHIVADOR JASPEADO FOLIO SIN RADO LIDERPA 10,00 2,01 21,00 20,10\n"
             "Sociedad DSG26401516 C.250 SOBRES ADHES. PACKING-LIST 240x140 (ext.) 3,00 19,18 21,00 57,54\n"
@@ -794,8 +864,12 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertEqual(result["lineas"][1]["precio"], "19.18")
         self.assertEqual(result["lineas"][3]["importe_origen"], "145.01")
         self.assertEqual(result["validacion"]["unresolved_lines"], 1)
-        self.assertTrue(result["totales"]["reconciled"])
-        self.assertEqual(result["totales"]["computed_gross"], "301.83")
+        # The fixture's four lines sum to 230.45, not the printed base 249.45.
+        # A printed total must never hide a missing or misread line.
+        self.assertEqual(result["lineas"][2]["cantidad"], "20.00")
+        self.assertEqual(result["lineas"][2]["precio"], "0.39")
+        self.assertFalse(result["totales"]["reconciled"])
+        self.assertEqual(result["totales"]["computed_gross"], "278.84")
 
     def test_purchase_entry_pdf_resolves_supplier_name_ignoring_metalfix_customer(self):
         db = PurchaseEntryDb()
@@ -807,7 +881,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "Cliente 1826\n"
             "METALFIX SUMINISTROS INDUSTRIALES SL\n"
             "30/09/2026\n"
-            "REF-A1 Articulo uno 3 10 21",
+            "REF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
 
@@ -829,7 +903,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "METALFIX SUMINISTROS INDUSTRIALES SL\n"
             "Factura Nº FAC-77\n"
             "15/09/2026\n"
-            "REF-A1 Articulo uno 3 10 21",
+            "REF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
 
@@ -952,7 +1026,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "C.I.F.: B11111111\n"
             "Factura Nº 25/77\n"
             "30/09/2026\n"
-            "REF-A1 Articulo uno 3 10 21",
+            "REF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
         svc._resolve_purchase_provider_by_name = lambda name: {
@@ -976,7 +1050,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "CIF: B44\n"
             "Factura Nº FAC-77\n"
             "Fecha factura: 15/09/2026\n"
-            "REF-A1 Articulo uno 3 10 21",
+            "REF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
 
@@ -1069,6 +1143,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
     def test_purchase_entry_pdf_parses_redur_transport_lines_with_glued_amounts(self):
         db = PurchaseEntryDb(supplier_article=False)
         svc = faro_mcp.FaroPhase1Service(db)
+        svc._internal_article_for_entry = lambda code: None
         svc._purchase_entry_pdf_text = lambda args: (
             "LOZANO TRANSPORTES, S.A.U.\n"
             "METALFIX SUMINISTROS INDUST. S.L.U.\n"
@@ -1098,7 +1173,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertEqual(result["lineas"][0]["importe_origen"], "61.46")
         self.assertEqual(result["lineas"][1]["referencia_proveedor"], "CARGO_COMBUSTIBLE")
         self.assertEqual(result["totales"]["computed_gross"], "84.18")
-        self.assertTrue(result["totales"]["reconciled"])
+        self.assertIsNone(result["totales"]["reconciled"])
         self.assertFalse(result["validacion"]["can_create_entry"])
         self.assertEqual(result["validacion"]["unresolved_lines"], 2)
         self.assertIn("unresolved_article", result["advertencias"])
@@ -1297,7 +1372,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
 
         self.assertEqual(result["lineas"][0]["cantidad"], "3")
         self.assertEqual(result["lineas"][0]["precio"], "10")
-        self.assertNotIn("descuento1", result["lineas"][0])
+        self.assertEqual(Decimal(result["lineas"][0]["descuento1"]), 0)
         self.assertEqual(result["lineas"][0]["iva"], "21")
         self.assertEqual(result["lineas"][0]["importe_origen"], "30")
 
@@ -1336,7 +1411,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             {"origen": "factura.pdf", "bytes": 1234},
         )
 
-        with self.assertRaisesRegex(faro_mcp.FaroError, "descuadre"):
+        with self.assertRaisesRegex(faro_mcp.FaroError, "no cuadra"):
             svc.create_purchase_entry_from_pdf({"proveedor": 44, "centro": 7})
 
         self.assertEqual(db.commits, 0)
@@ -1428,6 +1503,9 @@ class Phase2FLogisticsTests(unittest.TestCase):
             def proposal(args):
                 seen.append(Path(str(args.get("ruta_pdf"))).name)
                 return {
+                    "hash_sha256": hashlib.sha256(Path(args["ruta_pdf"]).read_bytes()).hexdigest(),
+                    "pdf": {"origen": args["ruta_pdf"]},
+                    "totales": {"source_gross": "9.68"},
                     "cabecera": {"proveedor": 44, "albaran": "ALB-1", "factura": ""},
                     "lineas": [{"articulo": "A1", "cantidad": "1", "precio": "8", "resuelto": True}],
                 }
@@ -1571,7 +1649,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             {"origen": "factura.pdf", "bytes": 1234},
         )
 
-        with self.assertRaisesRegex(faro_mcp.FaroError, "no se detectaron lineas"):
+        with self.assertRaisesRegex(faro_mcp.FaroError, "No se han detectado lineas"):
             svc.create_purchase_entry_from_pdf({"proveedor": 44, "centro": 7})
 
         self.assertEqual(db.commits, 0)
@@ -1583,7 +1661,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         encoded = self._pdf_base64(["Factura Nº FAC-77\nFecha factura: 15/09/2026", ""])
         svc._extract_purchase_entry_pdf_ocr_text = lambda data, source: (_ for _ in ()).throw(faro_mcp.FaroError("OCR roto"))
 
-        with self.assertRaisesRegex(faro_mcp.FaroError, "extraccion incompleta"):
+        with self.assertRaisesRegex(faro_mcp.FaroError, "no cubrio todas las paginas"):
             svc.create_purchase_entry_from_pdf({
                 "proveedor": 44,
                 "centro": 7,
@@ -1657,7 +1735,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         self.assertEqual(result["documento"], {"centro": 7, "ejercicio": 2026, "serie": "EN", "numero": 101})
         self.assertEqual(result["lineas_pdf_detectadas"], 1)
         self.assertEqual(result["articulos"][0]["articulo"], "A1")
-        self.assertEqual(db.commits, 1)
+        self.assertEqual(db.commits, 2)
         self.assertEqual(document["subtipo"], "Facturas.Proveedor")
         self.assertIn("Compras\\Facturas.Proveedor\\2026\\9\\", document["fichero"])
         sql_text = "\n".join(sql for sql, _ in db.executed)
@@ -1735,7 +1813,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         proposal = {
             "version": 1,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "cabecera": {
                 "centro": 7,
                 "proveedor": 44,
@@ -1744,6 +1822,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
                 "fecha": "2026-09-15",
                 "fecha_factura": "2026-09-15",
             },
+            "totales": {"source_gross": "36.30"},
             "lineas": [{
                 "referencia_proveedor": "REF-A1",
                 "descripcion": "Articulo uno",
@@ -1760,16 +1839,17 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "PROPUESTA",
             "GDI_VERSION": 1,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_PROPUESTA": json.dumps(proposal),
         }
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (_ for _ in ()).throw(AssertionError("no debe reextraer PDF"))
 
         result = svc.confirm_purchase_entry_importation({
+            "content_base64": "JVBERi0xLjQKJSB0ZXN0Cg==", "nombre_fichero": "factura.pdf",
             "propuesta_id": "IMP-1",
             "version": 1,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
         })
 
         self.assertTrue(result["ok"])
@@ -1785,7 +1865,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         proposal = {
             "version": 1,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "cabecera": {
                 "centro": 7,
                 "proveedor": 44,
@@ -1794,6 +1874,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
                 "fecha": "2026-09-15",
                 "fecha_factura": "2026-09-15",
             },
+            "totales": {"source_gross": "36.30"},
             "lineas": [{
                 "referencia_proveedor": "REF-A1",
                 "descripcion": "Articulo uno",
@@ -1810,7 +1891,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "PROPUESTA",
             "GDI_VERSION": 1,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_ORIGEN": "factura.pdf",
             "GDI_PROPUESTA": json.dumps(proposal),
         }
@@ -1820,7 +1901,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             result = svc.confirm_purchase_entry_importation({
                 "propuesta_id": "IMP-1",
                 "version": 1,
-                "hash_sha256": "abc123",
+                "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
                 "content_base64": "JVBERi0xLjQKJSB0ZXN0Cg==",
                 "nombre_fichero": "factura.pdf",
             })
@@ -1834,7 +1915,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb(supplier_article=False)
         proposal = {
             "version": 1,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "cabecera": {
                 "centro": 7,
                 "proveedor": 44,
@@ -1843,6 +1924,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
                 "fecha": "2026-09-15",
                 "fecha_factura": "2026-09-15",
             },
+            "totales": {"source_gross": "36.30"},
             "lineas": [{
                 "referencia_proveedor": "REF-NO",
                 "descripcion": "Articulo fantasma",
@@ -1864,16 +1946,17 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "REVISADA",
             "GDI_VERSION": 1,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_PROPUESTA": json.dumps(proposal),
         }
         svc = faro_mcp.FaroPhase1Service(db)
         svc._internal_article_for_entry = lambda codart: None
 
         result = svc.confirm_purchase_entry_importation({
+            "content_base64": "JVBERi0xLjQKJSB0ZXN0Cg==", "nombre_fichero": "factura.pdf",
             "propuesta_id": "IMP-1",
             "version": 1,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "cabecera": {"politica_articulo_no_encontrado": "fantasma"},
             "lineas": proposal["lineas"],
         })
@@ -1891,7 +1974,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "PROPUESTA",
             "GDI_VERSION": 1,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_PROPUESTA": json.dumps({
                 "cabecera": {"centro": 7, "proveedor": 44, "factura": "FAC-77"},
                 "lineas": [{"referencia_proveedor": "REF-A1", "cantidad": "1"}],
@@ -1914,7 +1997,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         proposal = {
             "version": 1,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "cabecera": {"centro": 7, "proveedor": 44, "factura": "FAC-77", "fecha": "2026-09-15"},
             "lineas": [{"referencia_proveedor": "REF-A1", "descripcion": "Articulo uno", "cantidad": "1", "precio": "10", "iva": "21"}],
             "totales": {"source_gross": "24.20"},
@@ -1926,7 +2009,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "PROPUESTA",
             "GDI_VERSION": 1,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_PROPUESTA": json.dumps(proposal),
         }
         svc = faro_mcp.FaroPhase1Service(db)
@@ -1934,7 +2017,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         result = svc.save_purchase_entry_importation_revision({
             "propuesta_id": "IMP-1",
             "version": 1,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "lineas": [{
                 "referencia_proveedor": "REF-A1",
                 "descripcion": "Articulo uno",
@@ -1962,7 +2045,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "REVISADA",
             "GDI_VERSION": 2,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_PROPUESTA": json.dumps({"cabecera": {}, "lineas": [], "validacion": {}}),
         }
         svc = faro_mcp.FaroPhase1Service(db)
@@ -1971,7 +2054,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             svc.save_purchase_entry_importation_revision({
                 "propuesta_id": "IMP-1",
                 "version": 1,
-                "hash_sha256": "abc123",
+                "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
                 "cabecera": {"factura": "FAC-NEW"},
             })
 
@@ -1984,7 +2067,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "REVISADA",
             "GDI_VERSION": 2,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_PROPUESTA": json.dumps({"cabecera": {}, "lineas": []}),
         }
         svc = faro_mcp.FaroPhase1Service(db)
@@ -1992,7 +2075,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         result = svc.delete_purchase_entry_importation_revision({
             "propuesta_id": "IMP-1",
             "version": 2,
-            "hash_sha256": "abc123",
+            "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
         })
 
         self.assertTrue(result["ok"])
@@ -2008,7 +2091,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_NUMEMP": 1,
             "GDI_ESTADO": "CONFIRMADA",
             "GDI_VERSION": 2,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_PROPUESTA": json.dumps({"cabecera": {}, "lineas": []}),
         }
         svc = faro_mcp.FaroPhase1Service(db)
@@ -2017,7 +2100,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             svc.delete_purchase_entry_importation_revision({
                 "propuesta_id": "IMP-1",
                 "version": 2,
-                "hash_sha256": "abc123",
+                "hash_sha256": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             })
 
         self.assertFalse(any(sql.startswith("DELETE FROM GDC_IMPORTACION") for sql, _ in db.executed))
@@ -2038,7 +2121,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_CENTRO": 7,
             "GDI_ESTADO": "REVISADA",
             "GDI_VERSION": 2,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_ORIGEN": "factura.pdf",
             "GDI_PROPUESTA": json.dumps(proposal),
             "GDI_FECMOD": "2026-10-06T10:00:00",
@@ -2064,7 +2147,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
             "GDI_CENTRO": 7,
             "GDI_ESTADO": "PROPUESTA",
             "GDI_VERSION": 1,
-            "GDI_HASH": "abc123",
+            "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
             "GDI_ORIGEN": "facturas/fac-buscada.pdf",
             "GDI_PROPUESTA": json.dumps({"cabecera": {"factura": "FAC-BUSCADA"}, "lineas": []}),
             "GDI_FECMOD": "2026-10-06T10:00:00",
@@ -2093,7 +2176,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
                 "GDI_CENTRO": 7,
                 "GDI_ESTADO": "CONFIRMADA",
                 "GDI_VERSION": 2,
-                "GDI_HASH": "abc123",
+                "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
                 "GDI_ORIGEN": str(pdf),
                 "GDI_ENT_CENTRO": 7,
                 "GDI_ENT_EJERCI": 2026,
@@ -2135,7 +2218,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
                 "GDI_CENTRO": 7,
                 "GDI_ESTADO": "CONFIRMADA",
                 "GDI_VERSION": 2,
-                "GDI_HASH": "abc123",
+                "GDI_HASH": hashlib.sha256(b"%PDF-1.4\n% test\n").hexdigest(),
                 "GDI_ORIGEN": str(pdf),
                 "GDI_ENT_CENTRO": 7,
                 "GDI_ENT_EJERCI": 2026,
@@ -2159,7 +2242,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
-            "CIF: B44\nFactura Nº FAC-77\nAlbarán Nº ALB-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21",
+            "CIF: B44\nFactura Nº FAC-77\nAlbarán Nº ALB-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -2197,7 +2280,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
                 "proveedor": 44,
                 "centro": 7,
                 "ruta_imagen": str(image),
-                "texto_extraido": "CIF: B44\nAlbaran No: ALB-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21",
+                "texto_extraido": "CIF: B44\nAlbaran No: ALB-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             })
 
             gd_path = Path(result["gestion_documental"]["ruta"])
@@ -2234,7 +2317,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
-            "CIF: B999\nFactura Nº FAC-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21",
+            "CIF: B999\nFactura Nº FAC-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
 
@@ -2248,7 +2331,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         svc = faro_mcp.FaroPhase1Service(db)
         svc._internal_article_for_entry = lambda codart: None
         svc._purchase_entry_pdf_text = lambda args: (
-            "CIF: B44\nFactura Nº FAC-77\n15/09/2026\nREF-NO Articulo fantasma 3 10 21",
+            "CIF: B44\nFactura Nº FAC-77\n15/09/2026\nREF-NO Articulo fantasma 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -2272,7 +2355,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
-            "CIF: B44\nFactura Nº FAC-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21",
+            "CIF: B44\nFactura Nº FAC-77\n15/09/2026\nREF-A1 Articulo uno 3 10 21\nTOTAL FACTURA 36.30",
             {"origen": "factura.pdf", "bytes": 1234},
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -2297,7 +2380,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
-            "CIF: B44\nFactura Nº FAC-77\n15/09/2026\nREF-A1 Articulo uno 3 7 21",
+            "CIF: B44\nFactura Nº FAC-77\n15/09/2026\nREF-A1 Articulo uno 3 7 21\nTOTAL FACTURA 25.41",
             {"origen": "factura.pdf", "bytes": 1234},
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -2320,7 +2403,7 @@ class Phase2FLogisticsTests(unittest.TestCase):
         db = PurchaseEntryDb()
         svc = faro_mcp.FaroPhase1Service(db)
         svc._purchase_entry_pdf_text = lambda args: (
-            "CIF: B44\nFactura Nº FAC-77\nFecha factura: 15/09/2026\nREF-A1 Articulo gratis 1 0 21",
+            "CIF: B44\nFactura Nº FAC-77\nFecha factura: 15/09/2026\nREF-A1 Articulo gratis 1 0 21\nTOTAL FACTURA 0.00",
             {"origen": "factura.pdf", "bytes": 1234},
         )
         with tempfile.TemporaryDirectory() as tmp:

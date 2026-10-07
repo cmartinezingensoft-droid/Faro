@@ -163,21 +163,27 @@ cd C:\IA\Faro\MCP
 .\.venv\Scripts\python.exe -m pytest tests\ -q
 ```
 
-Estado actual: **356/356 pruebas** correctas, mas **371 subtests parametrizados**.
+Validacion de esta entrega: **459 pruebas unitarias correctas** con `python -m unittest discover -s tests -v`. Incluye dobles de la base de datos y del SDK; no sustituye la prueba contra Firebird y el SDK instalados. Consulta `CORRECCIONES_FASE_1.md`.
+
+## Actualizacion documental 2026-10-07
+
+Antes de ejecutar la importacion corregida, aplica la migracion `migrations/20261007_gdc_locks.sql` una sola vez. Requiere la tabla `GDC_IMPORTACION` de la migracion anterior. Instrucciones completas en [CORRECCIONES_FASE_1.md](CORRECCIONES_FASE_1.md).
+
+La herramienta critica `entrada_almacen_propuesta_preparar` valida y persiste propuestas externas mediante el mismo control de permisos, auditoria y reglas de negocio que las propuestas nativas. No crea entradas ni stock.
 
 ## Catalogo de herramientas
 
-Version del servidor: **2.15.8**. Contrato publico: **2.0**. Migracion DataSnap -> Python nativo: **100 %** (0 proxies DataSnap).
+Version del servidor: **2.16.0**. Contrato publico: **2.0**. Migracion DataSnap -> Python nativo: **100 %** (0 proxies DataSnap).
 
 Herramientas publicas por perfil (`FARO_MCP_TOOL_PROFILE`):
 
 | Perfil | Herramientas | Descripcion |
 | --- | --- | --- |
-| `core` (por defecto) | 87 | Operacion habitual. |
-| `admin` | 96 | `core` + mantenimientos/operaciones avanzadas. |
-| `integrations` | 88 | `core` + integracion Coinfer. |
-| `all` | 97 | Union completa. |
-| `full` | 97 | Alias de compatibilidad de `all`. |
+| `core` (por defecto) | 99 | Operacion habitual. |
+| `admin` | 108 | `core` + mantenimientos/operaciones avanzadas. |
+| `integrations` | 100 | `core` + integracion Coinfer. |
+| `all` | 109 | Union completa. |
+| `full` | 109 | Alias de compatibilidad de `all`. |
 
 Cada herramienta tiene ademas un **nivel de riesgo** (`lectura`, `escritura` o `critica`) independiente del perfil, controlado por `FARO_MCP_ACCESS_LEVEL` (ver [Seguridad y auditoria](#seguridad-y-auditoria)). El borde del contrato v2 valida estrictamente los tipos JSON Schema usados por el catalogo, incluidos tipos alternativos como `number|string`, limites `minItems`/`maxItems`, `enum`, campos obligatorios y `additionalProperties=false`. El listado completo, siempre actualizado, esta disponible en vivo en `/ayuda` desde el Probador MCP o programaticamente via `faro_mcp.tool_definitions()`. Resumen por dominio (perfil `all`):
 

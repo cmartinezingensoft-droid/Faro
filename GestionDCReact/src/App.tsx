@@ -28,6 +28,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { mergeSavedRevision } from './review-state';
 
 type FileKind = 'pdf' | 'image' | 'text' | 'file';
 
@@ -174,6 +175,14 @@ type SaveRevisionResult = ConfirmResult & {
       version?: number;
       hash_sha256?: string;
     };
+    propuesta?: {
+      cabecera?: Record<string, unknown>;
+      lineas?: Array<Record<string, unknown>>;
+      validacion?: Record<string, unknown>;
+      totales?: Record<string, unknown>;
+      advertencias?: string[];
+      incidencias_revision?: DocumentResult['incidencias_revision'];
+    };
     validacion?: Record<string, unknown>;
     totales?: Record<string, unknown>;
     error?: {
@@ -196,6 +205,22 @@ type RetryDocumentResult = ConfirmResult & {
 };
 
 type DeleteRevisionResult = SaveRevisionResult;
+
+type CreateProvidersResult = {
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  structuredResult?: {
+    ok?: boolean;
+    creados?: Array<Record<string, unknown>>;
+    omitidos?: Array<Record<string, unknown>>;
+    error?: {
+      message?: string;
+    };
+  } | null;
+  state?: AppState;
+};
 
 type UploadResult = {
   ok: boolean;
@@ -239,12 +264,19 @@ type Notice = {
   variant?: 'info' | 'warning';
 };
 
+type ConfirmDialogAction = {
+  value: string;
+  label: string;
+  style?: 'primary' | 'secondary' | 'danger';
+};
+
 type ConfirmDialogState = {
   title: string;
   message: string;
   confirmText?: string;
   cancelText?: string;
   variant?: 'question' | 'danger';
+  actions?: ConfirmDialogAction[];
 };
 
 function formatBytes(value: number) {
@@ -313,8 +345,8 @@ function runHasIncidents(result: RunResult) {
 
 function runHasConfirmableProposals(result: RunResult) {
   return Boolean(result.structuredResult?.documentos?.some((item) => (
-    item.estado === 'propuesta'
-    || (item.importacion?.id && item.validacion?.can_create_entry !== false && item.estado !== 'procesado' && item.estado !== 'documentado')
+    (item.estado === 'propuesta' && item.validacion?.can_create_entry === true)
+    || (item.importacion?.id && item.validacion?.can_create_entry === true && item.estado !== 'procesado' && item.estado !== 'documentado')
   )));
 }
 
@@ -355,18 +387,40 @@ function duplicateDocumentIncident(result: RunResult) {
 }
 
 function hasProviderIncidentText(value?: string) {
-  return /proveedor (?:no encontrado|inexistente)|proveedor no existe|cif=.*proveedor/i.test(String(value || ''));
+  return /provider_unresolved|proveedor (?:no encontrado|inexistente)|proveedor no existe|cif=.*proveedor/i.test(String(value || ''));
 }
 
 function runHasProviderIncident(result: RunResult) {
   const structured = result.structuredResult;
   if (structured?.documentos?.some((item) => (
-    hasProviderIncidentText(item.motivo)
+    (item.validacion?.provider_resolved === false && item.cabecera?.solo_gestion_documental !== true)
+    || hasProviderIncidentText(item.motivo)
     || hasProviderIncidentText(item.error)
-    || item.incidencias_revision?.some((incident) => hasProviderIncidentText(incident.mensaje))
+    || item.incidencias_revision?.some((incident) => hasProviderIncidentText(incident.codigo) || hasProviderIncidentText(incident.mensaje))
   ))) return true;
   const content = result.latestLog?.content || '';
   return content.split(/\r?\n/).map(logMessage).some((line) => hasProviderIncidentText(line));
+}
+
+function missingProviderDocuments(result: RunResult) {
+  const seen = new Set<string>();
+  return (result.structuredResult?.documentos || []).filter((item) => {
+    if (item.cabecera?.solo_gestion_documental === true || item.validacion?.provider_resolved !== false) return false;
+    const header = item.cabecera || {};
+    const key = String(header.cif || header.nombre_proveedor || item.pdf || '').trim().toUpperCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function providerCreationSummary(documents: DocumentResult[]) {
+  return documents.map((item) => {
+    const header = item.cabecera || {};
+    const name = String(header.nombre_proveedor || 'Proveedor sin nombre').trim();
+    const cif = String(header.cif || '').trim();
+    return cif ? `${name} (${cif})` : name;
+  }).join(', ');
 }
 
 function normalizeIncidentText(value: unknown) {
@@ -448,11 +502,11 @@ function incidentMessage(result: RunResult) {
   if (runHasTotalMismatchIncident(result)) {
     return 'No se ha podido procesar porque el total calculado no cuadra con el documento.';
   }
-  if (runHasMissingArticleIncident(result)) {
-    return 'No se ha podido procesar porque no se ha encontrado el articulo.';
-  }
   if (runHasProviderIncident(result)) {
     return 'No se ha podido procesar porque el proveedor no existe.';
+  }
+  if (runHasMissingArticleIncident(result)) {
+    return 'No se ha podido procesar porque no se ha encontrado el articulo.';
   }
   if (runHasFileLockedIncident(result)) {
     return 'No se ha podido procesar porque el PDF está abierto o bloqueado por otro proceso.';
@@ -474,11 +528,21 @@ function incidentMessage(result: RunResult) {
 
 function highlightedNoticeMessage(message: string) {
   const normalizedMessage = normalizeIncidentText(message);
-  const parts = normalizedMessage.split(/(Entrada generada correctamente:[^.]*(?:\.)?|Documento integrado correctamente|Documento ya dado de alta|Entrada existente:[^.]*(?:\.)?|Proveedor no encontrado|proveedor no existe|proveedor inexistente|Articulo no encontrado|Artículo no encontrado|articulo no encontrado|PDF está abierto|bloqueado por otro proceso|no se han detectado líneas de detalle|No se ha podido procesar|ERROR|No se pudo)/i);
+  const parts = normalizedMessage.split(/(Entrada generada correctamente:[^.]*(?:\.)?|Documento integrado correctamente|Documento ya dado de alta|Entrada existente:[^.]*(?:\.)?|Proveedor no encontrado|proveedor no existe|proveedor inexistente|Articulo no encontrado|Artículo no encontrado|articulo no encontrado|PDF está abierto|bloqueado por otro proceso|no se han detectado líneas de detalle|No se ha podido procesar|\berror\b|No se pudo)/i);
   return parts.map((part, index) => (
-    /Entrada generada correctamente|Documento integrado correctamente|Documento ya dado de alta|Entrada existente|Proveedor no encontrado|proveedor no existe|proveedor inexistente|Articulo no encontrado|Artículo no encontrado|articulo no encontrado|PDF está abierto|bloqueado por otro proceso|no se han detectado líneas de detalle|No se ha podido procesar|ERROR|No se pudo/i.test(part)
+    /Entrada generada correctamente|Documento integrado correctamente|Documento ya dado de alta|Entrada existente|Proveedor no encontrado|proveedor no existe|proveedor inexistente|Articulo no encontrado|Artículo no encontrado|articulo no encontrado|PDF está abierto|bloqueado por otro proceso|no se han detectado líneas de detalle|No se ha podido procesar|\berror\b|No se pudo/i.test(part)
       ? <span className="noticeErrorText" key={`${part}-${index}`}>{part}</span>
       : part
+  ));
+}
+
+function highlightedNoticeDetail(detail: string) {
+  const normalizedDetail = normalizeIncidentText(detail);
+  const parts = normalizedDetail.split(/(\bentrada\s+\d{4}-[A-Z0-9]+-\d+\b|Entrada generada:[^.]*(?:\.)?)/i);
+  return parts.map((part, index) => (
+    /^(?:\bentrada\s+\d{4}-[A-Z0-9]+-\d+\b|Entrada generada:)/i.test(part)
+      ? <span className="noticeEntryText" key={`${part}-${index}`}>{part}</span>
+      : highlightedNoticeMessage(part)
   ));
 }
 
@@ -622,8 +686,22 @@ function integrationReport(result: RunResult) {
   return details;
 }
 
+let sessionToken: Promise<string> | null = null;
+async function localSessionToken(): Promise<string> {
+  if (!sessionToken) sessionToken = fetch('/api/session')
+    .then(async (response) => {
+      if (!response.ok) throw new Error('No se pudo iniciar la sesion local');
+      return String((await response.json()).token || '');
+    }).catch((error) => { sessionToken = null; throw error; });
+  return sessionToken;
+}
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const headers = new Headers(init?.headers);
+  if (init?.method && !['GET', 'HEAD'].includes(init.method.toUpperCase())) {
+    headers.set('x-gdc-token', await localSessionToken());
+  }
+  const response = await fetch(url, { ...init, headers });
+  if (response.status === 403) sessionToken = null;
   const payload = await response.json();
   if (!response.ok) {
     throw Object.assign(new Error(payload.error || 'Error de servidor'), { payload });
@@ -1294,17 +1372,22 @@ function ConfirmDialog({
   confirmText = 'Aceptar',
   cancelText = 'Cancelar',
   variant = 'question',
+  actions,
   onConfirm,
   onCancel,
+  onAction,
 }: {
   title: string;
   message: string;
   confirmText?: string;
   cancelText?: string;
   variant?: 'question' | 'danger';
+  actions?: ConfirmDialogAction[];
   onConfirm: () => void;
   onCancel: () => void;
+  onAction?: (value: string) => void;
 }) {
+  const dialogActions = actions?.length ? actions : null;
   return (
     <div className="noticeOverlay" role="alertdialog" aria-modal="true" aria-labelledby="confirmDialogTitle">
       <div className={`noticeCard aiConfirmCard ${variant === 'danger' ? 'warning' : 'question'}`}>
@@ -1316,12 +1399,27 @@ function ConfirmDialog({
           <p>{message}</p>
         </div>
         <div className="confirmActions">
-          <button type="button" className="secondaryAction" onClick={onCancel}>
-            {cancelText}
-          </button>
-          <button type="button" className="primaryAction" onClick={onConfirm}>
-            {confirmText}
-          </button>
+          {dialogActions
+            ? dialogActions.map((action) => (
+              <button
+                key={action.value}
+                type="button"
+                className={`${action.style || 'secondary'}Action`}
+                onClick={() => onAction?.(action.value)}
+              >
+                {action.label}
+              </button>
+            ))
+            : (
+              <>
+                <button type="button" className="secondaryAction" onClick={onCancel}>
+                  {cancelText}
+                </button>
+                <button type="button" className="primaryAction" onClick={onConfirm}>
+                  {confirmText}
+                </button>
+              </>
+            )}
         </div>
       </div>
     </div>
@@ -1336,14 +1434,20 @@ function validationIssues(item?: DocumentResult) {
   };
   if (!item) return issues;
   const validation = item.validacion || {};
+  const unresolved = Number(validation.unresolved_lines || 0);
+  const ghostLinesAllowed = validation.ghost_lines_allowed === true
+    || String(item.cabecera?.politica_articulo_no_encontrado || '').toLowerCase() === 'fantasma';
+  if (validation.provider_resolved === false && item.cabecera?.solo_gestion_documental !== true) {
+    addIssue('Selecciona un proveedor valido antes de confirmar la entrada');
+  }
   const hasMissingArticleSupplierIssue = (
-    Number(validation.unresolved_lines || 0) > 0
+    unresolved > 0
     || item.incidencias_revision?.some((incident) => isMissingArticleIncidentText(incident.codigo) || isMissingArticleIncidentText(incident.mensaje))
     || isMissingArticleIncidentText(item.motivo)
     || isMissingArticleIncidentText(item.error)
   );
-  if (validation.can_create_entry === false && hasMissingArticleSupplierIssue) {
-    return ['No se ha podido integrar porque no se ha encontrado el articulo-proveedor.'];
+  if (validation.can_create_entry === false && hasMissingArticleSupplierIssue && !ghostLinesAllowed) {
+    addIssue('No se ha podido integrar porque no se ha encontrado el articulo-proveedor.');
   }
   if (validation.can_create_entry === false && (
     validation.no_lines_detected === true
@@ -1351,7 +1455,7 @@ function validationIssues(item?: DocumentResult) {
     || isNoDetailLinesIncidentText(item.motivo)
     || isNoDetailLinesIncidentText(item.error)
   )) {
-    return ['No se ha podido integrar porque no se han detectado líneas de detalle.'];
+    addIssue('No se ha podido integrar porque no se han detectado líneas de detalle.');
   }
   const importation = item.importacion || {};
   const persisted = importation.persistida !== false && Boolean(importation.id);
@@ -1359,9 +1463,9 @@ function validationIssues(item?: DocumentResult) {
     const reason = cleanIssueText((importation as Record<string, unknown>).motivo);
     addIssue(`Propuesta no guardada${reason ? ` (${reason})` : ''}`);
   }
-  const unresolved = Number(validation.unresolved_lines || 0);
-  const ghostLinesAllowed = validation.ghost_lines_allowed === true
-    || String(item.cabecera?.politica_articulo_no_encontrado || '').toLowerCase() === 'fantasma';
+  if (!item.lineas?.length && item.cabecera?.solo_gestion_documental !== true) {
+    addIssue('No se han detectado lineas de detalle');
+  }
   if (unresolved > 0) {
     const refs = (item.lineas || [])
       .filter((line) => !String(line.articulo || '').trim())
@@ -1412,19 +1516,49 @@ function reviewGhostPolicyAllowed(item?: DocumentResult, header?: Record<string,
   return validation.ghost_lines_allowed === true || policy === 'fantasma';
 }
 
-function canConfirmWithGhostPrompt(item?: DocumentResult, lines?: Array<Record<string, unknown>>, header?: Record<string, unknown>) {
+function canConfirmWithGhostPolicy(item?: DocumentResult, lines?: Array<Record<string, unknown>>, header?: Record<string, unknown>) {
   if (!item?.importacion?.id || item.validacion?.can_create_entry !== false) return false;
-  if (reviewGhostPolicyAllowed(item, header)) return false;
+  if (!reviewGhostPolicyAllowed(item, header)) return false;
   if (unresolvedReviewLineCount(item, lines) <= 0) return false;
   const validation = item.validacion || {};
   return !validation.line_limit_reached
     && validation.pages_complete !== false
+    && validation.provider_resolved !== false
     && validation.total_reconciled !== false
     && validation.no_lines_detected !== true
     && validation.evidence_low_confidence !== true;
 }
 
+function canConfirmWithGhostPrompt(item?: DocumentResult, lines?: Array<Record<string, unknown>>, header?: Record<string, unknown>) {
+  if (reviewGhostPolicyAllowed(item, header)) return false;
+  return canConfirmWithGhostPolicy(item, lines, {
+    ...(header || {}),
+    politica_articulo_no_encontrado: 'fantasma',
+  });
+}
+
+function normalizeReviewDraftForCompare(value: Record<string, unknown>) {
+  const result: Record<string, unknown> = {};
+  Object.entries(value || {}).forEach(([key, fieldValue]) => {
+    if (fieldValue === undefined || fieldValue === null || fieldValue === '') return;
+    result[key] = fieldValue;
+  });
+  return result;
+}
+
+function normalizeReviewLineForCompare(line: Record<string, unknown>) {
+  const result = normalizeReviewDraftForCompare(line);
+  const article = String(result.articulo || '').trim();
+  const selection = String(result.article_selection || result.seleccion_articulo || '').trim().toLowerCase();
+  if (!article && (!selection || selection === 'manual' || selection === 'auto')) {
+    delete result.article_selection;
+    delete result.seleccion_articulo;
+  }
+  return result;
+}
+
 function reviewDocumentKey(item: DocumentResult) {
+  if (item.importacion?.id) return `id:${item.importacion.id}`;
   const hash = String(item.importacion?.hash_sha256 || '').trim().toLowerCase();
   if (hash) return `hash:${hash}`;
   const pdf = String(item.pdf || '').trim().toLowerCase();
@@ -1461,16 +1595,18 @@ function ReviewPanel({
   const [loadingStored, setLoadingStored] = useState(false);
   const [storedError, setStoredError] = useState('');
   const [reviewSearch, setReviewSearch] = useState('');
+  const [showConfirmed, setShowConfirmed] = useState(false);
   const [reviewOffset, setReviewOffset] = useState(0);
   const [storedTotal, setStoredTotal] = useState(0);
   const [deletedImportationIds, setDeletedImportationIds] = useState<Set<string>>(new Set());
   const reviewLimit = 25;
   const reviewableDocuments = documents.filter((item) => (
+    (showConfirmed === ['CONFIRMADA', 'DOCUMENTADA'].includes(String(item.importacion?.estado || item.estado || '').toUpperCase())) && (
     item.estado === 'simulado'
     || item.estado === 'requiere_revision'
     || item.estado === 'propuesta'
     || (item.importacion?.id && item.estado !== 'procesado' && item.estado !== 'documentado')
-  ));
+  )));
   const reviewDocs = dedupeReviewDocuments([
     ...storedDocs,
     ...reviewableDocuments,
@@ -1488,11 +1624,18 @@ function ReviewPanel({
   const [reviewPage, setReviewPage] = useState(1);
   const activeIssues = validationIssues(active);
   const ghostPromptAvailable = canConfirmWithGhostPrompt(active, linesDraft, headerDraft);
-  const confirmBlocked = !active?.importacion?.id || (active?.validacion?.can_create_entry === false && !ghostPromptAvailable);
+  const ghostPolicyConfirmable = canConfirmWithGhostPolicy(active, linesDraft, headerDraft);
+  const isDocumentOnly = headerDraft.solo_gestion_documental === true;
+  const hasConfirmableLines = linesDraft.length > 0 || isDocumentOnly;
+  const draftDirty = JSON.stringify(normalizeReviewDraftForCompare(headerDraft)) !== JSON.stringify(normalizeReviewDraftForCompare(active?.cabecera || {}))
+    || JSON.stringify(linesDraft.map((line) => normalizeReviewLineForCompare(line))) !== JSON.stringify((active?.lineas || []).map((line) => normalizeReviewLineForCompare(line)));
+  const canConfirmEntry = active?.validacion?.can_create_entry === true || ghostPromptAvailable || ghostPolicyConfirmable;
+  const confirmBlocked = !active?.importacion?.id || !hasConfirmableLines || draftDirty || showConfirmed
+    || (isDocumentOnly ? active?.validacion?.can_archive_document !== true : !canConfirmEntry);
   const documentRetryEnabled = Boolean(active?.importacion?.id && String(active.importacion.estado || active.estado || '').toUpperCase() === 'CONFIRMADA');
   const deleteRevisionEnabled = Boolean(
     active?.importacion?.id
-    && String(active.importacion.estado || active.estado || '').toUpperCase() !== 'CONFIRMADA'
+    && !['CONFIRMADA', 'DOCUMENTADA'].includes(String(active.importacion.estado || active.estado || '').toUpperCase())
   );
   const pageTotal = Math.max(1, Number(active?.pdf_meta?.page_count || 1));
   const sourceFile = active?.pdf
@@ -1513,21 +1656,27 @@ function ReviewPanel({
   }, [runResult]);
 
   useEffect(() => {
+    const controller = new AbortController();
     setLoadingStored(true);
     const params = new URLSearchParams({
       limit: String(reviewLimit),
       offset: String(reviewOffset),
       search: reviewSearch,
+      estados: showConfirmed ? 'CONFIRMADA,DOCUMENTADA' : 'PROPUESTA,REVISADA',
     });
-    requestJson<ImportationsResult>(`/api/importations?${params.toString()}`)
+    requestJson<ImportationsResult>(`/api/importations?${params.toString()}`, { signal: controller.signal })
       .then((result) => {
+        if (controller.signal.aborted) return;
         setStoredDocs(result.structuredResult?.documentos || []);
         setStoredTotal(Number(result.structuredResult?.total || 0));
         setStoredError('');
       })
-      .catch((err: any) => setStoredError(String(err.message || err)))
-      .finally(() => setLoadingStored(false));
-  }, [state, reviewOffset, reviewSearch]);
+      .catch((err: any) => { if (!controller.signal.aborted) setStoredError(String(err.message || err)); })
+      .finally(() => { if (!controller.signal.aborted) setLoadingStored(false); });
+    return () => controller.abort();
+  }, [state, reviewOffset, reviewSearch, showConfirmed]);
+
+  useEffect(() => { setActiveIndex(0); }, [reviewOffset, reviewSearch, showConfirmed]);
 
   const activeDraftKey = [
     active?.pdf || '',
@@ -1550,7 +1699,7 @@ function ReviewPanel({
 
   function setLineField(index: number, field: string, value: string) {
     setLinesDraft((current) => current.map((line, lineIndex) => (
-      lineIndex === index ? { ...line, [field]: value } : line
+      lineIndex === index ? { ...line, [field]: value, ...(field === 'articulo' ? { seleccion_articulo: 'manual', article_selection: 'manual' } : {}) } : line
     )));
   }
 
@@ -1585,16 +1734,15 @@ function ReviewPanel({
         }),
       });
       if (result.ok && active.importacion) {
-        const confirmedId = String(active.importacion.id);
-        active.importacion.estado = 'CONFIRMADA';
-        active.estado = 'confirmada';
-        setDeletedImportationIds((current) => {
-          const next = new Set(current);
-          next.add(confirmedId);
-          return next;
-        });
-        setStoredDocs((current) => current.filter((item) => String(item.importacion?.id || '') !== confirmedId));
-        setActiveIndex((index) => Math.max(0, index - 1));
+        const confirmed: DocumentResult = { ...active,
+          cabecera: { ...confirmHeaderDraft }, lineas: linesDraft.map((line) => ({ ...line })),
+          importacion: { ...active.importacion, estado: String(result.structuredResult?.importacion?.estado || 'CONFIRMADA') },
+          estado: 'confirmada',
+        };
+        setStoredDocs((current) => [confirmed, ...current.filter((item) => item.importacion?.id !== confirmed.importacion?.id)]);
+        setShowConfirmed(true);
+        setReviewOffset(0);
+        setActiveIndex(0);
       }
       onConfirmed(result);
     } catch (err: any) {
@@ -1646,12 +1794,14 @@ function ReviewPanel({
           lineas: linesDraft,
         }),
       });
-      if (result.structuredResult?.importacion && active.importacion) {
-        active.importacion.version = result.structuredResult.importacion.version;
-        active.importacion.estado = result.structuredResult.importacion.estado;
+      const saved = result.structuredResult;
+      if (saved?.importacion && saved.propuesta) {
+        const updated: DocumentResult = mergeSavedRevision(active, saved.propuesta, saved.importacion);
+        setStoredDocs((current) => [updated, ...current.filter((item) => item.importacion?.id !== updated.importacion?.id)]);
+        setActiveIndex(0);
+        setHeaderDraft({ ...(updated.cabecera || {}) });
+        setLinesDraft((updated.lineas || []).map((line) => ({ ...line })));
       }
-      if (result.structuredResult?.validacion) active.validacion = result.structuredResult.validacion;
-      if (result.structuredResult?.totales) active.totales = result.structuredResult.totales;
       setSavedMessage(`Revision guardada. Version ${result.structuredResult?.importacion?.version || ''}`);
     } catch (err: any) {
       const payload = err.payload as SaveRevisionResult | undefined;
@@ -1722,6 +1872,7 @@ function ReviewPanel({
             placeholder="Buscar factura, albaran, ruta o propuesta"
           />
         </label>
+        <label><input type="checkbox" checked={showConfirmed} onChange={(event) => { setShowConfirmed(event.target.checked); setReviewOffset(0); }} /> Confirmadas / archivadas</label>
         <button type="button" disabled={reviewOffset <= 0 || loadingStored} onClick={() => setReviewOffset(Math.max(0, reviewOffset - reviewLimit))}>
           Anterior
         </button>
@@ -1814,6 +1965,26 @@ function ReviewPanel({
                   </label>
                 ))}
               </div>
+              <div className="fieldGrid">
+                <label><span>Total del documento comprobado</span>
+                  <input value={textValue(headerDraft.total_documento)} onChange={(event) => setHeaderField('total_documento', event.target.value)} placeholder="Opcional: total leido en el original" />
+                </label>
+                <label><span>Politica de precios de compra</span>
+                  <select value={textValue(headerDraft.politica_precio_compra) || 'mantener'} onChange={(event) => setHeaderField('politica_precio_compra', event.target.value)}>
+                    <option value="mantener">Mantener</option><option value="actualizar">Actualizar</option><option value="actualizar_si_sube">Actualizar solo si sube</option>
+                  </select>
+                </label>
+              </div>
+              {active?.validacion?.source_total_detected === false && <label>
+                <input type="checkbox" checked={headerDraft.confirmar_sin_total === true} onChange={(event) => setHeaderDraft((current) => ({ ...current, confirmar_sin_total: event.target.checked }))} />
+                He revisado todas las lineas; el documento no informa un total contrastable.
+              </label>}
+              {active?.validacion?.evidence_low_confidence === true && <label>
+                <input type="checkbox" checked={headerDraft.evidencia_revisada === true} onChange={(event) => setHeaderDraft((current) => ({ ...current, evidencia_revisada: event.target.checked }))} />
+                He contrastado la lectura de baja confianza con el original.
+              </label>}
+              {isDocumentOnly && <p>Esta propuesta solo archiva el documento; no genera entradas ni stock.</p>}
+              {draftDirty && <p>Guarda la revision para validar los cambios antes de confirmar.</p>}
             </div>
             <div className="lineEditor">
               <div className="lineEditorHeader">
@@ -1847,7 +2018,7 @@ function ReviewPanel({
                     <input value={textValue(line.descuento1)} onChange={(event) => setLineField(index, 'descuento1', event.target.value)} />
                     <input value={textValue(line.iva)} onChange={(event) => setLineField(index, 'iva', event.target.value)} />
                     <input value={textValue(line.importe_origen)} onChange={(event) => setLineField(index, 'importe_origen', event.target.value)} />
-                    <select value={textValue(line.article_selection || line.seleccion_articulo)} onChange={(event) => setLineField(index, 'seleccion_articulo', event.target.value)}>
+                    <select value={textValue(line.article_selection || line.seleccion_articulo)} onChange={(event) => setLineField(index, 'article_selection', event.target.value)}>
                       <option value="">Auto</option>
                       <option value="manual">Manual</option>
                     </select>
@@ -1874,7 +2045,7 @@ function ReviewPanel({
                 title={confirmBlocked ? activeIssues[0] || 'No hay propuesta persistida confirmable' : 'Confirmar propuesta'}
                 onClick={() => confirmActive()}
               >
-                {confirming ? 'Confirmando...' : 'Confirmar propuesta'}
+                {confirming ? 'Confirmando...' : isDocumentOnly ? 'Archivar documento' : 'Confirmar propuesta'}
               </button>
               <button
                 type="button"
@@ -1922,7 +2093,7 @@ export default function App() {
   const [showAiFallbackConfirm, setShowAiFallbackConfirm] = useState(false);
   const aiFallbackConfirmResolver = useRef<((value: boolean) => void) | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
-  const confirmDialogResolver = useRef<((value: boolean) => void) | null>(null);
+  const confirmDialogResolver = useRef<((value: boolean | string | null) => void) | null>(null);
   const [activeLog, setActiveLog] = useState<LogItem | undefined>();
   const [search, setSearch] = useState('');
   const [running, setRunning] = useState(false);
@@ -2089,11 +2260,18 @@ export default function App() {
   function askConfirm(dialog: ConfirmDialogState) {
     setConfirmDialog(dialog);
     return new Promise<boolean>((resolve) => {
-      confirmDialogResolver.current = resolve;
+      confirmDialogResolver.current = (value) => resolve(value === true);
     });
   }
 
-  function resolveConfirmDialog(value: boolean) {
+  function askChoice(dialog: ConfirmDialogState) {
+    setConfirmDialog(dialog);
+    return new Promise<string | null>((resolve) => {
+      confirmDialogResolver.current = (value) => resolve(typeof value === 'string' ? value : null);
+    });
+  }
+
+  function resolveConfirmDialog(value: boolean | string | null) {
     confirmDialogResolver.current?.(value);
     confirmDialogResolver.current = null;
     setConfirmDialog(null);
@@ -2152,7 +2330,7 @@ export default function App() {
       const aiResult = await requestJson<RunResult>('/api/ai-fallback', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ result, missingPolicy: state.modes[activeMode]?.missingPolicy || 'detener' }),
+        body: JSON.stringify({ result, mode: activeMode, missingPolicy: state.modes[activeMode]?.missingPolicy || 'detener' }),
       });
       return aiResult;
     };
@@ -2161,12 +2339,62 @@ export default function App() {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mode, selectedNames: names, aiFallback: false }),
     });
+    const discardImportations = async (documents: DocumentResult[]) => {
+      await Promise.all(documents.map(async (item) => {
+        if (!item.importacion?.id || !item.importacion.version || !item.importacion.hash_sha256) return;
+        try {
+          await requestJson<DeleteRevisionResult>('/api/delete-importation', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              propuestaId: item.importacion.id,
+              version: item.importacion.version,
+              hashSha256: item.importacion.hash_sha256,
+            }),
+          });
+        } catch {
+          // If it was already deleted or changed, rerun will surface the current state.
+        }
+      }));
+    };
+    const maybeCreateMissingProviders = async (result: RunResult) => {
+      const documents = missingProviderDocuments(result);
+      if (!documents.length) return result;
+      const action = await askChoice({
+        title: 'Proveedor no encontrado',
+        message: `El proveedor no existe en Faro: ${providerCreationSummary(documents)}. Elija si quiere grabar el proveedor, guardar solo en DOCUMENTO sin entrada de almacen, o detener sin hacer nada.`,
+        actions: [
+          { value: 'create_provider', label: 'Grabar el proveedor', style: 'primary' },
+          { value: 'document_only', label: 'Guardar solo DOCUMENTO', style: 'secondary' },
+          { value: 'stop', label: 'Detener', style: 'danger' },
+        ],
+      });
+      if (action === 'document_only') {
+        setMessage('Guardando solo en gestion documental...');
+        await discardImportations(documents);
+        return runSelectedMode('documental');
+      }
+      if (action !== 'create_provider') return result;
+      setMessage('Dando de alta proveedor en Faro...');
+      const created = await requestJson<CreateProvidersResult>('/api/providers/create-from-documents', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ documentos: documents }),
+      });
+      if (created.state) setState(created.state);
+      const createdCount = Number(created.structuredResult?.creados?.length || 0);
+      if (!createdCount) return result;
+      setMessage('Proveedor creado. Reprocesando fichero...');
+      await discardImportations(documents);
+      return runSelectedMode(activeMode);
+    };
     const maybeAskForGhostLines = async (result: RunResult) => {
       if (
         processOptions.documentOnly
         || processOptions.ghostLines
         || activeMode === 'fantasma'
         || activeMode === 'fantasma_sube'
+        || runHasProviderIncident(result)
         || runHasTotalMismatchIncident(result)
         || !runHasMissingArticleIncident(result)
       ) {
@@ -2185,13 +2413,15 @@ export default function App() {
     try {
       const result = await runSelectedMode(activeMode);
       const reviewedResult = await maybeAskForAi(result);
-      applyRunResult(await maybeAskForGhostLines(reviewedResult));
+      const providerResult = await maybeCreateMissingProviders(reviewedResult);
+      applyRunResult(await maybeAskForGhostLines(providerResult));
     } catch (err: any) {
       const payload = err.payload as RunResult | undefined;
       if (payload) {
         try {
           const reviewedPayload = await maybeAskForAi(payload);
-          applyRunResult(await maybeAskForGhostLines(reviewedPayload));
+          const providerPayload = await maybeCreateMissingProviders(reviewedPayload);
+          applyRunResult(await maybeAskForGhostLines(providerPayload));
         } catch (aiErr: any) {
           const aiPayload = aiErr.payload as RunResult | undefined;
           if (aiPayload) applyRunResult(aiPayload);
@@ -2523,7 +2753,7 @@ export default function App() {
               {!!notice.details?.length && (
                 <ul className="noticeDetails">
                   {notice.details.map((detail, index) => (
-                    <li key={`${detail}-${index}`}>{highlightedNoticeMessage(detail)}</li>
+                    <li key={`${detail}-${index}`}>{highlightedNoticeDetail(detail)}</li>
                   ))}
                 </ul>
               )}
@@ -2560,6 +2790,7 @@ export default function App() {
           {...confirmDialog}
           onCancel={() => resolveConfirmDialog(false)}
           onConfirm={() => resolveConfirmDialog(true)}
+          onAction={(value) => resolveConfirmDialog(value)}
         />
       )}
 

@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { execFileSync } from 'node:child_process';
+import { runProcess } from './process_runner.mjs';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,14 +8,17 @@ import { fileURLToPath } from 'node:url';
 
 const PORT = Number(process.env.GESTIONDC_API_PORT || 8877);
 const MAIN_DIR = process.env.FARO_MAIN_DIR || 'C:\\Proyectos\\Faro';
-const GESTION_DIR = path.join(MAIN_DIR, 'GestionDC');
+const GESTION_DIR = path.resolve(process.env.FARO_GESTION_DC_DIR || path.join(MAIN_DIR, 'GestionDC'));
+const DOCUMENTS_DIR = path.resolve(MAIN_DIR, process.env.FARO_DOCUMENTS_DIR || 'Documentos');
 const PENDING_DIR = path.join(GESTION_DIR, 'Pendientes');
 const PROCESSED_DIR = path.join(GESTION_DIR, 'Procesados');
 const PURCHASES_DIR = path.join(GESTION_DIR, 'Compras');
 const LOGS_DIR = path.join(GESTION_DIR, 'Logs');
 const HOLD_DIR = path.join(GESTION_DIR, '.app_hold');
 const PREVIEW_DIR = path.join(GESTION_DIR, '.app_preview');
-const AI_CONFIG_PATH = path.join(GESTION_DIR, '.app_ai_config.json');
+const PRIVATE_CONFIG_DIR = path.resolve(process.env.GESTIONDC_CONFIG_DIR || path.join(MAIN_DIR, '.GestionDC-private'));
+const AI_CONFIG_PATH = path.join(PRIVATE_CONFIG_DIR, 'ai-config.json');
+const LOCAL_SESSION_TOKEN = crypto.randomBytes(32).toString('hex');
 const BAT_PATH = path.join(GESTION_DIR, 'procesar_pendientes.bat');
 const DEFAULT_ENTRY_CENTER = Number(process.env.FARO_CENTRO || 0);
 
@@ -28,6 +31,8 @@ const SAVE_IMPORTATION_SCRIPT = path.join(__dirname, 'save_importation.py');
 const LIST_IMPORTATIONS_SCRIPT = path.join(__dirname, 'list_importations.py');
 const RETRY_IMPORTATION_DOCUMENT_SCRIPT = path.join(__dirname, 'retry_importation_document.py');
 const PERSIST_AI_IMPORTATION_SCRIPT = path.join(__dirname, 'persist_ai_importation.py');
+const PREPARE_DOCUMENT_SCRIPT = path.join(__dirname, 'prepare_document.py');
+const CREATE_PROVIDERS_SCRIPT = path.join(__dirname, 'create_providers_from_documents.py');
 
 const defaultAiConfig = {
   enabled: false,
@@ -128,13 +133,13 @@ function readAiConfig() {
 }
 
 function saveAiConfig(payload) {
-  ensureDir(GESTION_DIR);
+  ensureDir(PRIVATE_CONFIG_DIR);
   const current = readAiConfig();
   const next = normalizeAiConfig(payload, current);
   if (!String(payload.apiKey || '').trim() && current.apiKey) {
     next.apiKey = current.apiKey;
   }
-  fs.writeFileSync(AI_CONFIG_PATH, JSON.stringify(next, null, 2), 'utf8');
+  fs.writeFileSync(AI_CONFIG_PATH, JSON.stringify(next, null, 2), { encoding: 'utf8', mode: 0o600 });
   return publicAiConfig(next);
 }
 
@@ -144,31 +149,38 @@ function normalizePath(value) {
 
 function assertInsideRoot(filePath) {
   const normalized = normalizePath(filePath);
-  const allowedRoots = [GESTION_DIR, path.join(MAIN_DIR, 'Documentos')].map(normalizePath);
+  const allowedRoots = [GESTION_DIR, DOCUMENTS_DIR].map(normalizePath);
   if (!allowedRoots.some((root) => normalized === root || normalized.startsWith(root + path.sep))) {
     throw new Error('Ruta fuera de GestionDC/FARO');
   }
+  const matchingRoot = allowedRoots.find((root) => normalized === root || normalized.startsWith(root + path.sep));
+  const relative = path.relative(matchingRoot, normalized);
+  if (relative.split(path.sep).some((segment) => segment.startsWith('.'))) throw new Error('Archivo privado');
+  if (fs.existsSync(normalized)) {
+    const realPath = fs.realpathSync(normalized);
+    const realRoot = fs.realpathSync(matchingRoot);
+    if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) throw new Error('Ruta enlazada fuera del directorio permitido');
+  }
+  if (normalized === PRIVATE_CONFIG_DIR || normalized.startsWith(PRIVATE_CONFIG_DIR + path.sep)) throw new Error('Archivo privado');
   return normalized;
 }
 
-function listFiles(dir, recursive = false, limit = 500) {
-  if (!fs.existsSync(dir)) return [];
+async function listFiles(dir, recursive = false, limit = 500) {
   const result = [];
-  const visit = (current) => {
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+  const visit = async (current) => {
+    let entries;
+    try { entries = await fs.promises.readdir(current, { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue;
       const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (recursive) visit(fullPath);
-        continue;
-      }
-      const stat = fs.statSync(fullPath);
-      result.push(toFileItem(fullPath, stat));
+      if (entry.isDirectory()) { if (recursive) await visit(fullPath); continue; }
+      try { result.push(toFileItem(fullPath, await fs.promises.stat(fullPath))); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
   };
-  visit(dir);
-  return result
-    .sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime())
-    .slice(0, limit);
+  await visit(dir);
+  return result.sort((a, b) => Date.parse(b.modifiedAt) - Date.parse(a.modifiedAt)).slice(0, limit);
 }
 
 function toFileItem(fullPath, stat = fs.statSync(fullPath)) {
@@ -193,8 +205,8 @@ function fileKind(ext) {
   return 'file';
 }
 
-function readLog(filePath) {
-  const content = fs.readFileSync(filePath, 'utf8');
+async function readLog(filePath) {
+  const content = await fs.promises.readFile(filePath, 'utf8');
   const lines = content.split(/\r?\n/).filter(Boolean);
   const summaryLine = [...lines].reverse().find((line) => line.includes('Fin integracion')) || '';
   const cause = extractCause(lines);
@@ -223,21 +235,21 @@ function extractCause(lines) {
   return (causes[0] || lines.at(-1) || '').trim();
 }
 
-function listLogs() {
-  return listFiles(LOGS_DIR, false, 80).map((item) => {
+async function listLogs() {
+  return Promise.all((await listFiles(LOGS_DIR, false, 80)).map(async (item) => {
     try {
-      return readLog(item.path);
+      return await readLog(item.path);
     } catch {
       return item;
     }
-  });
+  }));
 }
 
-function getState() {
-  const pending = listFiles(PENDING_DIR, false, 300);
-  const processed = listFiles(PROCESSED_DIR, false, 120);
-  const documents = listFiles(PURCHASES_DIR, true, 300);
-  const logs = listLogs();
+async function getState() {
+  const pending = await listFiles(PENDING_DIR, false, 300);
+  const processed = await listFiles(PROCESSED_DIR, false, 120);
+  const documents = await listFiles(PURCHASES_DIR, true, 300);
+  const logs = await listLogs();
   return {
     mainDir: MAIN_DIR,
     gestionDir: GESTION_DIR,
@@ -260,6 +272,8 @@ function json(res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
     'content-length': Buffer.byteLength(body),
   });
   res.end(body);
@@ -338,14 +352,14 @@ function selectedNamesFromPayload(payload) {
   return names.map((name) => path.basename(String(name))).filter(Boolean);
 }
 
-function selectedPendingItems(payload) {
+async function selectedPendingItems(payload) {
   const selected = new Set(selectedNamesFromPayload(payload).map((name) => name.toLowerCase()));
   if (!selected.size) throw new Error('Selecciona al menos un fichero');
-  return listFiles(PENDING_DIR, false, 1000).filter((item) => selected.has(item.name.toLowerCase()));
+  return (await listFiles(PENDING_DIR, false, 1000)).filter((item) => selected.has(item.name.toLowerCase()));
 }
 
-function deletePendingFiles(payload) {
-  const items = selectedPendingItems(payload);
+async function deletePendingFiles(payload) {
+  const items = await selectedPendingItems(payload);
   for (const item of items) {
     const safePath = assertInsideRoot(item.path);
     if (path.dirname(safePath) !== normalizePath(PENDING_DIR)) throw new Error('Solo se pueden eliminar pendientes');
@@ -354,8 +368,8 @@ function deletePendingFiles(payload) {
   return items;
 }
 
-function archivePendingFiles(payload) {
-  const items = selectedPendingItems(payload);
+async function archivePendingFiles(payload) {
+  const items = await selectedPendingItems(payload);
   ensureDir(PROCESSED_DIR);
   const moved = [];
   for (const item of items) {
@@ -368,8 +382,8 @@ function archivePendingFiles(payload) {
   return moved;
 }
 
-function generatePdfsFromImages(payload) {
-  const items = selectedPendingItems(payload).filter((item) => item.kind === 'image');
+async function generatePdfsFromImages(payload) {
+  const items = (await selectedPendingItems(payload)).filter((item) => item.kind === 'image');
   if (!items.length) throw new Error('Selecciona una imagen pendiente para generar PDF');
   const script = `
 import sys
@@ -400,30 +414,9 @@ for i in range(1, len(sys.argv), 2):
     args.push(item.path, target);
     generated.push(target);
   }
-  execFileSync('python', args, { stdio: 'pipe', windowsHide: true });
+  const rendered = await runProcess(process.env.PYTHON || 'python', args, { cwd: __dirname });
+  if (rendered.code !== 0) throw new Error(rendered.stderr || 'No se pudo generar el PDF');
   return generated.map((filePath) => toFileItem(filePath));
-}
-
-function holdUnselectedFiles(selectedNames) {
-  if (!selectedNames.length) return [];
-  ensureDir(HOLD_DIR);
-  const selected = new Set(selectedNames.map((name) => name.toLowerCase()));
-  const moved = [];
-  for (const item of listFiles(PENDING_DIR, false, 1000)) {
-    if (selected.has(item.name.toLowerCase())) continue;
-    const target = path.join(HOLD_DIR, `${Date.now()}_${item.name}`);
-    fs.renameSync(item.path, target);
-    moved.push({ from: item.path, to: target });
-  }
-  return moved;
-}
-
-function restoreHeldFiles(moved) {
-  for (const item of [...moved].reverse()) {
-    if (fs.existsSync(item.to) && !fs.existsSync(item.from)) {
-      fs.renameSync(item.to, item.from);
-    }
-  }
 }
 
 function parseJsonObjectFromOutput(output) {
@@ -512,7 +505,7 @@ function normalizeAiLines(lines) {
     if (/^\[\d{3,20}\]$/.test(String(item.referencia_proveedor || '').trim())) {
       item.referencia_proveedor = String(item.referencia_proveedor).replace(/[[\]]/g, '');
     }
-    if (bracketCode && !String(item.articulo || '').trim()) item.articulo = bracketCode;
+    item.articulo = ''; // Resolved against Faro by the audited backend.
     if (bracketCode && (!String(item.referencia_proveedor || '').trim() || isPlaceholderValue(item.referencia_proveedor))) {
       item.referencia_proveedor = bracketCode;
     }
@@ -528,6 +521,7 @@ function normalizeAiHeader(header) {
     if (!String(result.nombre_proveedor || '').trim()) result.nombre_proveedor = proveedor;
     result.proveedor = '';
   }
+  result.proveedor = ''; // Numeric document codes are not trusted ERP provider IDs.
   return result;
 }
 
@@ -536,20 +530,25 @@ function normalizeAiDocument(filePath, extracted, error = '', importacion = null
   const missingPolicy = options.missingPolicy === 'fantasma' ? 'fantasma' : 'detener';
   const lineas = normalizeAiLines(Array.isArray(extracted?.lineas) ? extracted.lineas : []);
   const totales = extracted && typeof extracted.totales === 'object' ? extracted.totales : {};
-  const hash = fs.existsSync(filePath) ? sha256File(filePath) : '';
+  const hash = options.pdfMeta?.hash_sha256 || (fs.existsSync(filePath) ? sha256File(filePath) : '');
   return {
     pdf: filePath,
     pdf_meta: {
       origen: filePath,
       extraction: 'ia',
+      page_count: options.pdfMeta?.page_count || 0,
+      processed_pages: options.pdfMeta?.processed_pages || [],
+      extraction_incomplete: options.pdfMeta?.extraction_incomplete !== false,
     },
     estado: 'requiere_revision',
     motivo: error || 'Propuesta generada por IA pendiente de revision',
     cabecera: {
-      centro: DEFAULT_ENTRY_CENTER,
       observaciones: 'Entrada propuesta desde IA',
-      politica_articulo_no_encontrado: missingPolicy,
       ...cabecera,
+      centro: DEFAULT_ENTRY_CENTER,
+      politica_articulo_no_encontrado: missingPolicy,
+      politica_precio_compra: options.pricePolicy || 'mantener',
+      solo_gestion_documental: Boolean(options.documentOnly),
     },
     lineas,
     totales,
@@ -606,132 +605,39 @@ function shortProcessError(error) {
   return usefulLine.replace(/^Command failed:\s*/i, '').slice(0, 240);
 }
 
-function persistAiDocument(document) {
-  if (!fs.existsSync(PERSIST_AI_IMPORTATION_SCRIPT)) {
-    return {
-      ...document,
-      importacion: {
-        ...(document.importacion || {}),
-        persistida: false,
-        motivo: `No existe ${path.basename(PERSIST_AI_IMPORTATION_SCRIPT)}`,
-      },
-      incidencias_revision: [
-        ...(document.incidencias_revision || []),
-        {
-          codigo: 'AI_PROPOSAL_NOT_PERSISTED',
-          mensaje: 'La propuesta de IA no se pudo guardar; no se puede confirmar hasta persistirla.',
-        },
-      ],
-    };
-  }
+async function persistAiDocument(document) {
   try {
-    const output = execFileSync(
-      process.env.PYTHON || 'python',
-      [PERSIST_AI_IMPORTATION_SCRIPT],
-      {
-        cwd: __dirname,
-        encoding: 'utf8',
-        input: JSON.stringify(aiProposalFromDocument(document)),
-        maxBuffer: 2_000_000,
-        windowsHide: true,
-      },
-    );
-    const persisted = unwrapToolResult(parseJsonObjectFromOutput(output));
-    if (persisted?.importacion?.persistida) {
-      const validation = persisted.proposal?.validacion || document.validacion || {};
-      const ready = validation.can_create_entry !== false;
-      return {
-        ...document,
-        estado: ready ? 'propuesta' : 'requiere_revision',
-        motivo: ready ? 'Propuesta generada por IA lista para confirmar' : document.motivo,
-        cabecera: persisted.proposal?.cabecera || document.cabecera,
-        lineas: persisted.proposal?.lineas || document.lineas,
-        totales: persisted.proposal?.totales || document.totales,
-        validacion: persisted.proposal?.validacion || document.validacion,
-        advertencias: persisted.proposal?.advertencias || document.advertencias,
-        incidencias_revision: persisted.proposal?.incidencias_revision || document.incidencias_revision,
-        importacion: persisted.importacion,
-      };
-    }
-    if (persisted?.error?.message) {
-      throw Object.assign(new Error(String(persisted.error.message)), { stdout: output });
-    }
+    const result = await runPythonScript(PERSIST_AI_IMPORTATION_SCRIPT, { propuesta: aiProposalFromDocument(document) });
+    const persisted = result.structuredResult;
+    if (!result.ok || !persisted?.importacion?.persistida) throw new Error(persisted?.error?.message || result.stderr || 'No se pudo guardar la propuesta');
+    const proposal = persisted.proposal;
+    const ready = proposal.validacion?.can_create_entry === true;
+    return { ...document, cabecera: proposal.cabecera, lineas: proposal.lineas, totales: proposal.totales,
+      pdf_meta: proposal.pdf, validacion: proposal.validacion, advertencias: proposal.advertencias,
+      incidencias_revision: proposal.incidencias_revision, importacion: persisted.importacion,
+      estado: persisted.importacion.estado === 'CONFIRMADA' ? 'confirmada' : ready ? 'propuesta' : 'requiere_revision',
+      motivo: ready ? 'Propuesta de IA validada; pendiente de confirmacion' : 'Revisa las incidencias de la propuesta',
+    };
   } catch (error) {
-    const message = shortProcessError(error);
-    return {
-      ...document,
-      importacion: {
-        ...(document.importacion || {}),
-        persistida: false,
-        motivo: message,
-      },
-      incidencias_revision: [
-        ...(document.incidencias_revision || []),
-        {
-          codigo: 'AI_PROPOSAL_NOT_PERSISTED',
-          mensaje: `La propuesta de IA no se pudo guardar: ${message}`,
-        },
-      ],
-    };
+    return { ...document, importacion: { ...document.importacion, persistida: false, motivo: String(error.message || error) },
+      incidencias_revision: [{ codigo: 'AI_PROPOSAL_NOT_PERSISTED', mensaje: String(error.message || error) }] };
   }
+}
+
+async function prepareDocumentForAi(filePath) {
+  const result = await runProcess(process.env.PYTHON || 'python', [PREPARE_DOCUMENT_SCRIPT], {
+    cwd: __dirname, input: JSON.stringify({ path: filePath }), maxBytes: 80_000_000,
+  });
+  const document = parseJsonObjectFromOutput(result.stdout);
+  if (result.code !== 0 || document?.error || !document) throw new Error(document?.error || result.stderr || 'No se pudo preparar el documento');
   return document;
-}
-
-function extractPdfTextForAi(filePath) {
-  if (path.extname(filePath).toLowerCase() !== '.pdf') return '';
-  const script = `
-import sys
-from pathlib import Path
-try:
-    from pypdf import PdfReader
-    reader = PdfReader(sys.argv[1])
-    chunks = []
-    for page in reader.pages[:5]:
-        chunks.append(page.extract_text() or "")
-    print("\\n".join(chunks)[:30000])
-except Exception:
-    print("")
-`;
-  try {
-    return execFileSync(process.env.PYTHON || 'python', ['-c', script, filePath], {
-      cwd: __dirname,
-      encoding: 'utf8',
-      windowsHide: true,
-      maxBuffer: 512_000,
-    }).trim();
-  } catch {
-    return '';
-  }
-}
-
-function aiImageInputs(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  if (fileKind(ext) === 'image') {
-    return [{ mimeType: contentTypeFor(filePath), data: fs.readFileSync(filePath).toString('base64') }];
-  }
-  if (ext !== '.pdf') return [];
-  ensureDir(PREVIEW_DIR);
-  const hash = crypto.createHash('sha1').update(`${filePath}|${fs.statSync(filePath).mtimeMs}|${fs.statSync(filePath).size}|ai`).digest('hex');
-  const prefix = path.join(PREVIEW_DIR, `${hash}_page`);
-  try {
-    execFileSync('pdftoppm', ['-png', '-r', '160', '-f', '1', '-l', '3', filePath, prefix], {
-      stdio: 'ignore',
-      windowsHide: true,
-    });
-  } catch {
-    return [];
-  }
-  return fs.readdirSync(PREVIEW_DIR)
-    .filter((name) => name.startsWith(`${hash}_page`) && name.endsWith('.png'))
-    .sort()
-    .slice(0, 3)
-    .map((name) => ({ mimeType: 'image/png', data: fs.readFileSync(path.join(PREVIEW_DIR, name)).toString('base64') }));
 }
 
 async function callAiForDocument(filePath, config, options = {}) {
   const safePath = assertInsideRoot(filePath);
-  const extractedText = extractPdfTextForAi(safePath);
-  const imageInputs = aiImageInputs(safePath);
+  const prepared = await prepareDocumentForAi(safePath);
+  const extractedText = prepared.text;
+  const imageInputs = prepared.images;
   if (!extractedText && !imageInputs.length) {
     throw new Error('No se pudo preparar texto ni imagenes del documento para IA.');
   }
@@ -747,9 +653,11 @@ async function callAiForDocument(filePath, config, options = {}) {
           'Reglas obligatorias:',
           '- No inventes valores. Si no ves un dato, dejalo vacio.',
           '- No uses ejemplos ni placeholders como REF001, REF002, Producto A, Producto B o Proveedor Ejemplo.',
-          '- Si la descripcion contiene un codigo entre corchetes como [10081], usa ese codigo como articulo y referencia_proveedor si no hay otra referencia clara.',
+          '- Los codigos impresos son referencias del proveedor; no asumas que son articulos internos del ERP.',
           '- Si aparece EAN: 8427338100813, devuelve tambien ean con ese valor.',
-          '- Devuelve solo JSON valido con cabecera, lineas y totales.',
+          '- Devuelve solo JSON valido con cabecera, lineas y totales. totales debe contener source_gross (total final), source_net y source_tax, como numeros o cadenas decimales.',
+          '- No conoces los codigos internos del ERP: cabecera.proveedor debe estar vacio. Identifica al emisor por cif y nombre_proveedor; no confundas sus datos con los del destinatario.',
+          '- Cada linea debe incluir cantidad, precio, iva, descuento1 a descuento6 e importe_origen. Conserva todas las apariciones repetidas y su pagina.',
           '',
           `Nombre de fichero: ${path.basename(safePath)}`,
           extractedText ? `Texto extraido:\n${extractedText}` : 'Texto extraido: no disponible; usa las imagenes adjuntas.',
@@ -794,8 +702,10 @@ async function callAiForDocument(filePath, config, options = {}) {
     if (!extracted || typeof extracted !== 'object') {
       throw new Error('La IA no devolvio JSON utilizable');
     }
+    if (data?.choices?.[0]?.finish_reason === 'length') throw new Error('La respuesta de IA se ha truncado; aumenta el limite de salida o divide el documento.');
+    if (!Array.isArray(extracted.lineas) || !extracted.cabecera || !extracted.totales) throw new Error('La IA no devolvio cabecera, lineas y totales con el formato requerido');
     assertNoAiPlaceholders(extracted);
-    return persistAiDocument(normalizeAiDocument(safePath, extracted, '', null, options));
+    return persistAiDocument(normalizeAiDocument(safePath, extracted, '', null, { ...options, pdfMeta: prepared }));
   } finally {
     clearTimeout(timeout);
   }
@@ -815,7 +725,10 @@ async function applyAiFallback(result, payload) {
     return result;
   }
   const aiDocuments = [];
-  const options = { missingPolicy: payload.missingPolicy === 'fantasma' ? 'fantasma' : 'detener' };
+  const mode = integrationModes[payload.mode || result.mode || 'entrada'];
+  if (!mode) throw new Error('Modo de IA no valido');
+  const options = { missingPolicy: payload.missingPolicy === 'fantasma' ? 'fantasma' : mode.missingPolicy,
+    pricePolicy: mode.pricePolicy, documentOnly: mode.documentOnly === '1' };
   for (const item of failed) {
     try {
       aiDocuments.push(await callAiForDocument(item.pdf, config, options));
@@ -837,276 +750,108 @@ async function applyAiFallback(result, payload) {
 async function runAiFallback(payload) {
   const result = payload.result && typeof payload.result === 'object' ? payload.result : null;
   if (!result) throw new Error('Resultado de integracion requerido para aplicar IA');
-  return applyAiFallback(result, { aiFallback: true, missingPolicy: payload.missingPolicy });
+  return applyAiFallback(result, { aiFallback: true, missingPolicy: payload.missingPolicy, mode: payload.mode || result.mode });
 }
 
-function runIntegration(payload) {
+async function runPythonScript(scriptPath, payload) {
+  const output = await runProcess(process.env.PYTHON || 'python', [scriptPath], {
+    cwd: __dirname, input: JSON.stringify(payload), timeoutMs: 300_000,
+  });
+  const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(output.stdout));
+  return { ok: output.code === 0 && structuredResult?.ok !== false && Boolean(structuredResult),
+    exitCode: output.code, stdout: output.stdout, stderr: output.stderr, structuredResult };
+}
+
+async function runIntegration(payload) {
   const modeKey = String(payload.mode || 'entrada');
   const mode = integrationModes[modeKey];
   if (!mode) throw new Error('Modo de integracion no valido');
-  if (!fs.existsSync(RUN_PENDING_SCRIPT)) {
-    throw new Error(`No existe el lanzador de integracion: ${RUN_PENDING_SCRIPT}`);
-  }
   const selectedNames = selectedNamesFromPayload(payload);
-  const limit = selectedNames.length ? String(selectedNames.length) : String(payload.limit || '');
-  const args = [RUN_PENDING_SCRIPT, mode.missingPolicy, mode.pricePolicy, limit, mode.documentOnly, JSON.stringify(selectedNames)];
-  return new Promise((resolve) => {
-    const env = {
-      ...process.env,
-      FARO_BATCH_NOPAUSE: '1',
-      FARO_BATCH_NOPOPUP: '1',
-    };
-    const child = spawn(process.env.PYTHON || 'python', args, {
-      cwd: __dirname,
-      env,
-      windowsHide: true,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('close', async (code) => {
-      const latestLog = listLogs()[0] || null;
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      const result = {
-        ok: code === 0 && !(structuredResult?.errores > 0) && !(structuredResult?.requiere_revision > 0),
-        exitCode: code,
-        mode: modeKey,
-        modeTitle: mode.title,
-        selectedNames,
-        stdout,
-        stderr,
-        structuredResult,
-        latestLog,
-        state: getState(),
-      };
-      resolve(await applyAiFallback(result, payload));
-    });
-    child.on('error', (error) => {
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      resolve({
-        ok: false,
-        exitCode: -1,
-        mode: modeKey,
-        modeTitle: mode.title,
-        selectedNames,
-        stdout,
-        stderr: stderr + String(error),
-        structuredResult,
-        latestLog: listLogs()[0] || null,
-        state: getState(),
-      });
-    });
+  if (!selectedNames.length) throw new Error('Selecciona al menos un fichero para integrar');
+  const result = await runPythonScript(RUN_PENDING_SCRIPT, {
+    politica_articulo_no_encontrado: mode.missingPolicy,
+    politica_precio_compra: mode.pricePolicy,
+    solo_gestion_documental: mode.documentOnly === '1',
+    selected_names: selectedNames, limite: selectedNames.length, persistir_propuesta: true,
   });
+  result.ok = result.ok && !(result.structuredResult?.errores > 0) && !(result.structuredResult?.requiere_revision > 0);
+  Object.assign(result, { mode: modeKey, modeTitle: mode.title, selectedNames, latestLog: (await listLogs())[0] || null, state: await getState() });
+  return applyAiFallback(result, payload);
 }
 
-function cleanupPendingAfterConfirmation(result, document) {
-  if (!result?.ok || result.structuredResult?.pendiente_borrado?.borrado === true) return result;
-  const pendingPath = String(document?.pdf || document?.pdf_meta?.origen || '').trim();
-  if (!pendingPath) return result;
-  const safePath = assertInsideRoot(pendingPath);
-  if (!fs.existsSync(safePath) || !fs.statSync(safePath).isFile()) return result;
-  if (path.dirname(safePath) !== normalizePath(PENDING_DIR)) return result;
+async function cleanupPendingAfterConfirmation(result) {
+  if (!result?.ok) return result;
+  const pendingPath = String(result.structuredResult?.origen || '').trim();
+  const expectedHash = String(result.structuredResult?.importacion?.hash_sha256 || '');
+  if (!pendingPath || !expectedHash) return result;
+  try {
+    const safePath = assertInsideRoot(pendingPath);
+    if (!fs.existsSync(safePath) || path.dirname(safePath) !== normalizePath(PENDING_DIR)) return result;
+    if (sha256File(safePath) !== expectedHash) throw new Error('El pendiente ha cambiado; se conserva el fichero nuevo');
+    ensureDir(PROCESSED_DIR);
+    const processedPath = uniquePath(PROCESSED_DIR, path.basename(safePath));
+    const size = fs.statSync(safePath).size;
+    fs.copyFileSync(safePath, processedPath, fs.constants.COPYFILE_EXCL);
+    if (sha256File(processedPath) !== expectedHash || sha256File(safePath) !== expectedHash) throw new Error('No se ha podido verificar la copia; se conserva el pendiente');
+    fs.unlinkSync(safePath);
+    result.structuredResult.procesados = { ruta: processedPath, fichero: path.basename(processedPath), bytes: size };
+    result.structuredResult.pendiente_borrado = { ruta: safePath, borrado: true };
+  } catch (error) {
+    result.structuredResult.pendiente_borrado = { ruta: pendingPath, borrado: false, error: String(error.message || error) };
+  }
+  result.state = await getState();
+  return result;
+}
 
-  ensureDir(PROCESSED_DIR);
-  const processedPath = uniquePath(PROCESSED_DIR, path.basename(safePath));
-  const size = fs.statSync(safePath).size;
-  fs.copyFileSync(safePath, processedPath);
-  fs.unlinkSync(safePath);
-
-  result.structuredResult = {
-    ...(result.structuredResult || {}),
-    procesados: {
-      ruta: processedPath,
-      fichero: path.basename(processedPath),
-      bytes: size,
-      formato: path.extname(processedPath).slice(1).toLowerCase() || 'file',
-      fallback_app: true,
-    },
-    pendiente_borrado: {
-      ruta: safePath,
-      bytes: size,
-      borrado: true,
-      fallback_app: true,
-    },
-  };
-  result.state = getState();
+async function runImportationAction(payload, scriptPath) {
+  const propuestaId = String(payload.propuestaId || payload.propuesta_id || '').trim();
+  const version = Number(payload.version || 0);
+  const hash = String(payload.hashSha256 || payload.hash_sha256 || '').trim();
+  if (!propuestaId || !Number.isInteger(version) || version < 1 || !/^[0-9a-f]{64}$/i.test(hash)) throw new Error('Propuesta, version y hash SHA-256 validos son obligatorios');
+  const args = { propuesta_id: propuestaId, version, hash_sha256: hash };
+  if (scriptPath !== DELETE_IMPORTATION_SCRIPT) {
+    if (payload.cabecera !== undefined) args.cabecera = payload.cabecera;
+    if (payload.lineas !== undefined) args.lineas = payload.lineas;
+  }
+  const result = await runPythonScript(scriptPath, args);
+  result.state = await getState();
   return result;
 }
 
 async function confirmImportation(payload) {
-  const result = await runImportationAction(payload, CONFIRM_IMPORTATION_SCRIPT, 'confirmacion');
-  if (!result.ok || result.structuredResult?.pendiente_borrado?.borrado === true) return result;
-  const propuestaId = String(payload.propuestaId || payload.propuesta_id || '').trim();
-  if (!propuestaId) return result;
-  const importations = await listImportations({ limit: 200, estados: ['CONFIRMADA', 'PROPUESTA', 'REVISADA', 'IA_REVISION'] });
-  const document = importations.structuredResult?.documentos?.find((item) => String(item.importacion?.id || '') === propuestaId);
-  return cleanupPendingAfterConfirmation(result, document);
+  return cleanupPendingAfterConfirmation(await runImportationAction(payload, CONFIRM_IMPORTATION_SCRIPT));
 }
+function saveImportation(payload) { return runImportationAction(payload, SAVE_IMPORTATION_SCRIPT); }
+function deleteImportation(payload) { return runImportationAction(payload, DELETE_IMPORTATION_SCRIPT); }
 
-function saveImportation(payload) {
-  return runImportationAction(payload, SAVE_IMPORTATION_SCRIPT, 'revision');
-}
-
-function deleteImportation(payload) {
-  return runImportationAction(payload, DELETE_IMPORTATION_SCRIPT, 'borrado');
-}
-
-function retryImportationDocument(payload) {
-  if (!fs.existsSync(RETRY_IMPORTATION_DOCUMENT_SCRIPT)) {
-    throw new Error(`No existe el lanzador de reintento documental: ${RETRY_IMPORTATION_DOCUMENT_SCRIPT}`);
-  }
+async function retryImportationDocument(payload) {
   const propuestaId = String(payload.propuestaId || payload.propuesta_id || '').trim();
   if (!propuestaId) throw new Error('propuestaId es obligatorio');
-  const retryPayload = {
-    ruta_pdf: payload.rutaPdf || payload.ruta_pdf || '',
-    ruta_imagen: payload.rutaImagen || payload.ruta_imagen || '',
-    content_base64: payload.contentBase64 || payload.content_base64 || '',
-    content_base64_imagen: payload.contentBase64Imagen || payload.content_base64_imagen || '',
-    nombre_fichero: payload.nombreFichero || payload.nombre_fichero || '',
-    copiar_documentos_entradas: payload.copiarDocumentosEntradas ?? payload.copiar_documentos_entradas ?? true,
-  };
-  return new Promise((resolve) => {
-    const child = spawn(process.env.PYTHON || 'python', [RETRY_IMPORTATION_DOCUMENT_SCRIPT, propuestaId, JSON.stringify(retryPayload)], {
-      cwd: __dirname,
-      env: process.env,
-      windowsHide: true,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('close', (code) => {
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      resolve({
-        ok: code === 0 && Boolean(structuredResult?.ok),
-        exitCode: code,
-        stdout,
-        stderr,
-        structuredResult,
-        state: getState(),
-      });
-    });
-    child.on('error', (error) => {
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      resolve({
-        ok: false,
-        exitCode: -1,
-        stdout,
-        stderr: stderr + String(error),
-        structuredResult,
-        state: getState(),
-      });
-    });
+  const args = { propuesta_id: propuestaId, copiar_documentos_entradas: true };
+  for (const [source, target] of [['rutaPdf', 'ruta_pdf'], ['rutaImagen', 'ruta_imagen']]) {
+    if (payload[source] || payload[target]) args[target] = assertInsideRoot(payload[source] || payload[target]);
+  }
+  const result = await runPythonScript(RETRY_IMPORTATION_DOCUMENT_SCRIPT, args);
+  result.state = await getState();
+  return result;
+}
+
+async function listImportations(payload = {}) {
+  const allowed = new Set(['PROPUESTA', 'REVISADA', 'CONFIRMADA', 'DOCUMENTADA']);
+  const estados = Array.isArray(payload.estados) ? payload.estados : ['PROPUESTA', 'REVISADA'];
+  if (!estados.length || estados.some((state) => !allowed.has(state))) throw new Error('Estado de revision no valido');
+  return runPythonScript(LIST_IMPORTATIONS_SCRIPT, {
+    limite: Math.min(200, Math.max(1, Number(payload.limit || 25))),
+    offset: Math.max(0, Number(payload.offset || 0)), busqueda: String(payload.search || ''), estados,
   });
 }
 
-function listImportations(payload = {}) {
-  if (!fs.existsSync(LIST_IMPORTATIONS_SCRIPT)) {
-    throw new Error(`No existe el lanzador de propuestas: ${LIST_IMPORTATIONS_SCRIPT}`);
-  }
-  const limit = String(payload.limit || 50);
-  const offset = String(payload.offset || 0);
-  const search = String(payload.search || payload.busqueda || '');
-  const estados = JSON.stringify(Array.isArray(payload.estados) ? payload.estados : ['PROPUESTA', 'REVISADA', 'IA_REVISION']);
-  return new Promise((resolve) => {
-    const child = spawn(process.env.PYTHON || 'python', [LIST_IMPORTATIONS_SCRIPT, limit, estados, offset, search], {
-      cwd: __dirname,
-      env: process.env,
-      windowsHide: true,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('close', (code) => {
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      resolve({
-        ok: code === 0 && Boolean(structuredResult?.ok),
-        exitCode: code,
-        stdout,
-        stderr,
-        structuredResult,
-      });
-    });
-    child.on('error', (error) => {
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      resolve({
-        ok: false,
-        exitCode: -1,
-        stdout,
-        stderr: stderr + String(error),
-        structuredResult,
-      });
-    });
-  });
-}
-
-function runImportationAction(payload, scriptPath, label) {
-  if (!fs.existsSync(scriptPath)) {
-    throw new Error(`No existe el lanzador de ${label}: ${scriptPath}`);
-  }
-  const propuestaId = String(payload.propuestaId || payload.propuesta_id || '').trim();
-  const version = Number(payload.version || 0);
-  const hash = String(payload.hashSha256 || payload.hash_sha256 || '').trim();
-  if (!propuestaId || !version || !hash) throw new Error('propuestaId, version y hashSha256 son obligatorios');
-  const args = [
-    scriptPath,
-    propuestaId,
-    String(version),
-    hash,
-    JSON.stringify(payload.cabecera || {}),
-    JSON.stringify(Array.isArray(payload.lineas) ? payload.lineas : []),
-  ];
-  return new Promise((resolve) => {
-    const child = spawn(process.env.PYTHON || 'python', args, {
-      cwd: __dirname,
-      env: process.env,
-      windowsHide: true,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('close', (code) => {
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      resolve({
-        ok: code === 0 && Boolean(structuredResult?.ok),
-        exitCode: code,
-        stdout,
-        stderr,
-        structuredResult,
-        state: getState(),
-      });
-    });
-    child.on('error', (error) => {
-      const structuredResult = unwrapToolResult(parseJsonObjectFromOutput(stdout));
-      resolve({
-        ok: false,
-        exitCode: -1,
-        stdout,
-        stderr: stderr + String(error),
-        structuredResult,
-        state: getState(),
-      });
-    });
-  });
+async function createProvidersFromDocuments(payload = {}) {
+  const documents = Array.isArray(payload.documentos) ? payload.documentos : [];
+  if (!documents.length) throw new Error('No hay proveedores pendientes de alta');
+  const result = await runPythonScript(CREATE_PROVIDERS_SCRIPT, { documentos: documents });
+  result.state = await getState();
+  return result;
 }
 
 function contentTypeFor(filePath) {
@@ -1120,17 +865,22 @@ function contentTypeFor(filePath) {
   return 'application/octet-stream';
 }
 
-function serveFile(res, filePath) {
-  const safePath = assertInsideRoot(filePath);
+function serveFile(res, filePath, privatePreview = false) {
+  const safePath = privatePreview ? normalizePath(filePath) : assertInsideRoot(filePath);
+  if (privatePreview && (path.dirname(safePath) !== normalizePath(PREVIEW_DIR) || !/^[a-f0-9]{40}\.png$/.test(path.basename(safePath)))) throw new Error('Vista previa no valida');
   if (!fs.existsSync(safePath) || !fs.statSync(safePath).isFile()) {
     text(res, 404, 'No existe el fichero');
     return;
   }
   res.writeHead(200, {
     'content-type': contentTypeFor(safePath),
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'no-store',
     'content-disposition': `inline; filename="${path.basename(safePath).replaceAll('"', '')}"`,
   });
-  fs.createReadStream(safePath).pipe(res);
+  const stream = fs.createReadStream(safePath);
+  stream.on('error', () => res.destroy());
+  stream.pipe(res);
 }
 
 function existingDocumentPath(filePath) {
@@ -1144,7 +894,7 @@ function existingDocumentPath(filePath) {
   return safePath;
 }
 
-function servePreview(res, filePath, page = 1) {
+async function servePreview(res, filePath, page = 1) {
   const safePath = existingDocumentPath(filePath);
   if (!fs.existsSync(safePath) || !fs.statSync(safePath).isFile()) {
     text(res, 404, 'No existe el fichero');
@@ -1161,39 +911,60 @@ function servePreview(res, filePath, page = 1) {
   }
   ensureDir(PREVIEW_DIR);
   const stat = fs.statSync(safePath);
-  const safePage = Math.max(1, Number(page || 1));
+  const safePage = Number(page);
+  if (!Number.isInteger(safePage) || safePage < 1) throw new Error('Pagina no valida');
   const hash = crypto.createHash('sha1').update(`${safePath}|${stat.mtimeMs}|${stat.size}|${safePage}`).digest('hex');
   const prefix = path.join(PREVIEW_DIR, hash);
   const previewPath = `${prefix}.png`;
   if (!fs.existsSync(previewPath)) {
-    execFileSync('pdftoppm', ['-png', '-singlefile', '-r', '130', '-f', String(safePage), '-l', String(safePage), safePath, prefix], {
-      stdio: 'ignore',
-      windowsHide: true,
+    const result = await runProcess(process.env.PYTHON || 'python', [PREPARE_DOCUMENT_SCRIPT], {
+      cwd: __dirname, input: JSON.stringify({ path: safePath, preview: true, page: safePage, output: previewPath }),
     });
+    if (result.code !== 0) throw new Error(parseJsonObjectFromOutput(result.stdout)?.error || 'No se pudo renderizar el PDF');
   }
-  serveFile(res, previewPath);
+  serveFile(res, previewPath, true);
 }
 
 function openFile(filePath) {
   const safePath = assertInsideRoot(filePath);
   if (!fs.existsSync(safePath)) throw new Error('No existe el fichero');
   const stat = fs.statSync(safePath);
-  const args = stat.isDirectory()
-    ? ['/c', 'start', '', safePath]
-    : ['/c', 'explorer.exe', `/select,${safePath}`];
-  const child = spawn('cmd.exe', args, {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: false,
-  });
+  if (process.platform !== 'win32') throw new Error('Abrir en el explorador requiere Windows');
+  const args = stat.isDirectory() ? [safePath] : [`/select,${safePath}`];
+  const child = spawn('explorer.exe', args, { detached: true, stdio: 'ignore', windowsHide: false });
+  child.on('error', () => {});
   child.unref();
+}
+
+function validateLocalRequest(req) {
+  const devPorts = new Set(['5173', '5174', ...(process.env.GESTIONDC_DEV_PORTS || '').split(',').map((port) => port.trim()).filter(Boolean)]);
+  const expectedHosts = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
+  for (const port of devPorts) {
+    expectedHosts.add(`127.0.0.1:${port}`);
+    expectedHosts.add(`localhost:${port}`);
+  }
+  if (!expectedHosts.has(String(req.headers.host || '').toLowerCase())) throw Object.assign(new Error('Host no permitido'), { status: 403 });
+  if (req.headers.origin) {
+    const origin = new URL(String(req.headers.origin));
+    if (origin.protocol !== 'http:' || !expectedHosts.has(origin.host.toLowerCase())) throw Object.assign(new Error('Origen no permitido'), { status: 403 });
+  }
+  if (!['GET', 'HEAD'].includes(req.method)) {
+    if (String(req.headers['content-type'] || '').split(';')[0] !== 'application/json') throw Object.assign(new Error('Se requiere application/json'), { status: 415 });
+    const token = String(req.headers['x-gdc-token'] || '');
+    if (token.length !== LOCAL_SESSION_TOKEN.length || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(LOCAL_SESSION_TOKEN))) throw Object.assign(new Error('Sesion no valida; recarga la aplicacion'), { status: 403 });
+  }
 }
 
 const server = http.createServer(async (req, res) => {
   try {
+    validateLocalRequest(req);
     const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+    if (req.method === 'GET' && url.pathname === '/api/session') {
+      json(res, 200, { token: LOCAL_SESSION_TOKEN });
+      return;
+    }
     if (req.method === 'GET' && url.pathname === '/api/state') {
-      json(res, 200, getState());
+      json(res, 200, await getState());
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/ai-config') {
@@ -1210,12 +981,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/preview') {
-      servePreview(res, url.searchParams.get('path') || '', Number(url.searchParams.get('page') || 1));
+      await servePreview(res, url.searchParams.get('path') || '', Number(url.searchParams.get('page') || 1));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/api/log') {
       const filePath = assertInsideRoot(url.searchParams.get('path') || '');
-      json(res, 200, readLog(filePath));
+      json(res, 200, await readLog(filePath));
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/run') {
@@ -1254,11 +1025,18 @@ const server = http.createServer(async (req, res) => {
       json(res, result.ok ? 200 : 409, result);
       return;
     }
+    if (req.method === 'POST' && url.pathname === '/api/providers/create-from-documents') {
+      const payload = await readBody(req);
+      const result = await createProvidersFromDocuments(payload);
+      json(res, result.ok ? 200 : 409, result);
+      return;
+    }
     if (req.method === 'GET' && url.pathname === '/api/importations') {
       const result = await listImportations({
         limit: Number(url.searchParams.get('limit') || 50),
         offset: Number(url.searchParams.get('offset') || 0),
         search: url.searchParams.get('search') || '',
+        estados: (url.searchParams.get('estados') || 'PROPUESTA,REVISADA').split(','),
       });
       json(res, result.ok ? 200 : 409, result);
       return;
@@ -1266,25 +1044,25 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/upload') {
       const payload = await readBody(req);
       const saved = uploadPendingFiles(payload);
-      json(res, 200, { ok: true, saved, state: getState() });
+      json(res, 200, { ok: true, saved, state: await getState() });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/delete') {
       const payload = await readBody(req);
-      const deleted = deletePendingFiles(payload);
-      json(res, 200, { ok: true, deleted, state: getState() });
+      const deleted = await deletePendingFiles(payload);
+      json(res, 200, { ok: true, deleted, state: await getState() });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/archive') {
       const payload = await readBody(req);
-      const archived = archivePendingFiles(payload);
-      json(res, 200, { ok: true, archived, state: getState() });
+      const archived = await archivePendingFiles(payload);
+      json(res, 200, { ok: true, archived, state: await getState() });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/generate-pdf') {
       const payload = await readBody(req);
-      const generated = generatePdfsFromImages(payload);
-      json(res, 200, { ok: true, generated, state: getState() });
+      const generated = await generatePdfsFromImages(payload);
+      json(res, 200, { ok: true, generated, state: await getState() });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/api/open') {
@@ -1299,10 +1077,24 @@ const server = http.createServer(async (req, res) => {
     }
     text(res, 404, 'No encontrado');
   } catch (error) {
-    json(res, 500, { ok: false, error: String(error?.message || error) });
+    if (!res.headersSent) json(res, error.status || 500, { ok: false, error: String(error?.message || error) });
+    else res.destroy();
   }
 });
 
+ensureDir(PRIVATE_CONFIG_DIR);
+const legacyAiConfig = path.join(GESTION_DIR, '.app_ai_config.json');
+if (fs.existsSync(legacyAiConfig)) {
+  if (!fs.existsSync(AI_CONFIG_PATH)) {
+    const value = fs.readFileSync(legacyAiConfig);
+    fs.writeFileSync(AI_CONFIG_PATH, value, { mode: 0o600, flag: 'wx' });
+  }
+  else {
+    const backup = path.join(PRIVATE_CONFIG_DIR, `legacy-ai-config-${Date.now()}.json`);
+    fs.writeFileSync(backup, fs.readFileSync(legacyAiConfig), { mode: 0o600, flag: 'wx' });
+  }
+  fs.unlinkSync(legacyAiConfig);
+}
 ensureDir(PENDING_DIR);
 ensureDir(PROCESSED_DIR);
 ensureDir(LOGS_DIR);

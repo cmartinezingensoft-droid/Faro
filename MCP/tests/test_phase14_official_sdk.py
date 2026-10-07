@@ -124,12 +124,12 @@ class Phase14OfficialSdkTests(unittest.TestCase):
             runtime = faro_mcp.FaroToolRuntime()
         server = sdk.build_server(runtime)
         self.assertEqual(server.name, "faro-mcp")
-        self.assertEqual(server.kwargs["version"], "2.15.8")
+        self.assertEqual(server.kwargs["version"], "2.16.0")
         self.assertTrue(callable(server.kwargs["on_list_tools"]))
         self.assertTrue(callable(server.kwargs["on_call_tool"]))
 
         result = asyncio.run(server.kwargs["on_list_tools"](SimpleNamespace(), None))
-        self.assertEqual(len(result.tools), 98)
+        self.assertEqual(len(result.tools), 99)
         self.assertEqual(
             {tool.name for tool in result.tools},
             {item["name"] for item in faro_mcp.tool_definitions("core")},
@@ -197,12 +197,12 @@ class Phase14OfficialSdkTests(unittest.TestCase):
         self.assertNotIn("from faro_mcp import main", source)
 
     def test_runtime_version_and_contract_stay_separate(self):
-        self.assertEqual(faro_mcp.SERVER_VERSION, "2.15.8")
+        self.assertEqual(faro_mcp.SERVER_VERSION, "2.16.0")
         self.assertEqual(faro_mcp.PUBLIC_CONTRACT_VERSION, "2.0")
-        self.assertEqual(len(faro_mcp.tool_definitions("core")), 98)
-        self.assertEqual(len(faro_mcp.tool_definitions("admin")), 107)
-        self.assertEqual(len(faro_mcp.tool_definitions("integrations")), 99)
-        self.assertEqual(len(faro_mcp.tool_definitions("all")), 108)
+        self.assertEqual(len(faro_mcp.tool_definitions("core")), 99)
+        self.assertEqual(len(faro_mcp.tool_definitions("admin")), 108)
+        self.assertEqual(len(faro_mcp.tool_definitions("integrations")), 100)
+        self.assertEqual(len(faro_mcp.tool_definitions("all")), 109)
 
 
 if __name__ == "__main__":

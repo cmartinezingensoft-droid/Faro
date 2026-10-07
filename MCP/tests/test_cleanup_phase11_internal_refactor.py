@@ -8,7 +8,7 @@ import faro_mcp
 from tests._runtime_compat import legacy_handle_for_test
 
 
-PHASE12_ALL_SCHEMA_SHA256 = "0e7e21ab44e4636dfa42d3932488c9870d81cf7467e11441c21e22ab9ee4f9d7"
+PHASE12_ALL_SCHEMA_SHA256 = "b63cbf81808c34d9e0fa6c5f4ba105a0a6cb4a3d92fa246f84cfd1a14f98a52b"
 # Hash actualizado de forma intencional:
 # 1) al permitir que stock_trasvasar reciba lineas con solo articulo+cantidad
 #    (descripcion/unidad_medida se autocompletan desde ARTICUL si se dejan

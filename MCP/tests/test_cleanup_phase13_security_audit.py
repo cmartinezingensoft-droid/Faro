@@ -38,7 +38,7 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
         self.assertEqual(union, faro_mcp.ALL_PUBLIC_TOOL_NAMES)
         self.assertEqual(len(faro_mcp.READ_ONLY_TOOL_NAMES), 70)
         self.assertEqual(len(faro_mcp.WRITE_TOOL_NAMES), 17)
-        self.assertEqual(len(faro_mcp.CRITICAL_TOOL_NAMES), 21)
+        self.assertEqual(len(faro_mcp.CRITICAL_TOOL_NAMES), 22)
         self.assertFalse(faro_mcp.READ_ONLY_TOOL_NAMES & faro_mcp.WRITE_TOOL_NAMES)
         self.assertFalse(faro_mcp.READ_ONLY_TOOL_NAMES & faro_mcp.CRITICAL_TOOL_NAMES)
         self.assertFalse(faro_mcp.WRITE_TOOL_NAMES & faro_mcp.CRITICAL_TOOL_NAMES)
@@ -210,11 +210,11 @@ class CleanupPhase13SecurityAuditTests(unittest.TestCase):
         ).encode("utf-8")
         self.assertEqual(
             hashlib.sha256(payload).hexdigest(),
-            "0e7e21ab44e4636dfa42d3932488c9870d81cf7467e11441c21e22ab9ee4f9d7",
+            "b63cbf81808c34d9e0fa6c5f4ba105a0a6cb4a3d92fa246f84cfd1a14f98a52b",
         )
 
     def test_server_version(self):
-        self.assertEqual(faro_mcp.SERVER_VERSION, "2.15.8")
+        self.assertEqual(faro_mcp.SERVER_VERSION, "2.16.0")
         self.assertEqual(faro_mcp.PUBLIC_CONTRACT_VERSION, "2.0")
 
 

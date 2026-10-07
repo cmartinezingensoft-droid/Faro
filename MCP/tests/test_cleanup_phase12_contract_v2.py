@@ -11,8 +11,8 @@ class CleanupPhase12ContractV2Tests(unittest.TestCase):
     def _definition(self, name, profile="all"):
         return next(item for item in faro_mcp.tool_definitions(profile) if item["name"] == name)
 
-    def test_profiles_and_tool_names_are_unchanged(self):
-        expected = {"core": 98, "admin": 107, "integrations": 99, "all": 108, "full": 108}
+    def test_profiles_include_validated_proposal_preparation(self):
+        expected = {"core": 99, "admin": 108, "integrations": 100, "all": 109, "full": 109}
         for profile, count in expected.items():
             with self.subTest(profile=profile):
                 self.assertEqual(len(faro_mcp.tool_definitions(profile)), count)
@@ -342,7 +342,7 @@ class CleanupPhase12ContractV2Tests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "NOT_FOUND")
 
     def test_server_version_and_contract_version(self):
-        self.assertEqual(faro_mcp.SERVER_VERSION, "2.15.8")
+        self.assertEqual(faro_mcp.SERVER_VERSION, "2.16.0")
         self.assertEqual(faro_mcp.PUBLIC_CONTRACT_VERSION, "2.0")
 
 

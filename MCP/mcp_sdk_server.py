@@ -10,7 +10,6 @@ import json
 import os
 from typing import Any
 
-import anyio
 from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -135,6 +134,7 @@ def main() -> None:
     transport = os.getenv("FARO_MCP_TRANSPORT", "stdio").strip().lower()
     server = build_server()
     if transport == "stdio":
+        import anyio
         anyio.run(run_stdio_async, server)
         return
     if transport in {"streamable-http", "http"}:
